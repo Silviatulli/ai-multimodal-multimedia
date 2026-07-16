@@ -62,7 +62,6 @@ try:
         build_video_index,
         get_video_info,
         get_video_windows,
-        load_participant_labels_from_predictions,
         sample_frames,
         sample_frames_from_segment,
     )
@@ -85,7 +84,6 @@ except ImportError:
         build_video_index,
         get_video_info,
         get_video_windows,
-        load_participant_labels_from_predictions,
         sample_frames,
         sample_frames_from_segment,
     )
@@ -791,6 +789,10 @@ def load_model(checkpoint_path: str, model_name: str = "MCG-NJU/videomae-base",
 def load_videos_from_predictions(categories_dir: str = CATEGORIES_DIR,
                                   data_dir: str = DATA_DIR):
     """Return ``(paths, labels, participants, time_offsets)`` from prediction CSVs."""
+    try:
+        from multimedia_data_preprocessing import load_participant_labels_from_predictions
+    except ImportError:
+        from .multimedia_data_preprocessing import load_participant_labels_from_predictions  # type: ignore[no-redef]
     samples     = load_participant_labels_from_predictions(data_dir)
     if not samples:
         raise ValueError(f"No prediction CSVs found under '{data_dir}'.")

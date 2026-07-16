@@ -5,35 +5,34 @@ End-to-end multimodal pipeline for continuous valence and arousal prediction.
 
 Modalities
 ----------
-    Audio         → acoustic features (librosa, 13 descriptors)
+    Audio         → acoustic features from video stimuli (librosa, 13 descriptors)
     EEG           → deep embeddings (BENDR pretrained contextual encoder)
-    Non-EEG physio→ precomputed feature vectors (pupil, ECG, EDA, …)
+    Physio        → precomputed features from features_arousal CSV
+                    (HRV, EDA/GSR, pupil dilation, saccades, respiration)
 
-All data is streamed from Azure Blob Storage (silver container) via
-DefaultAzureCredential or a connection-string.
+Data layout (silver container, protocol = protocolaudio)
+---------------------------------------------------------
+    NEURO/<protocol>/auxiliary_signals/<participant>/features_arousal_<participant>_<day>.csv
+        → time-series rows; rows with non-NaN `video` are stimulus windows
+        → columns: HRV, EDA, pupil, saccade, respiration, video, rating_valence, rating_arousal
 
-Azure data layout (silver container, default: protocolaudio)
--------------------------------------------------------------
-    NEURO/protocolimage/categories/<category>/<stimulus>.wav              ← audio
-    NEURO/<protocol>/deepclean2/<participant>/<stimulus>.csv              ← clean EEG
-    NEURO/<protocol>/auxiliary_signals/<participant>/<stimulus>.csv       ← physio
-    NEURO/<protocol>/labels/valence_arousal.csv                           ← labels
+    NEURO/protocolimage/categories/<category>/<video_name>
+        → the actual video/audio stimulus files
 
-Set AZURE_PROTOCOL env var to switch protocols (e.g. protocolaudio, protocolimage).
+    NEURO/<protocol>/deepclean/<participant>/<file>.csv
+        → clean EEG recordings aligned to the session
 
-Labels CSV columns
-------------------
-    participant_id, stimulus_id, valence, arousal
-    (valence and arousal in [-1, 1] or [1, 9] — either scale is accepted)
+Labels come from rating_valence / rating_arousal in the features_arousal files.
+Physio features are the other numeric columns in those same files, averaged
+over the stimulus window per (participant, video).
 
 Usage
 -----
-    python pipeline_valence_arousal.py                    # default (RF, 5-fold)
-    python pipeline_valence_arousal.py --model mlp        # MLP regressor
-    python pipeline_valence_arousal.py --n 50             # limit to 50 participants
-    python pipeline_valence_arousal.py --eeg-fs 250       # EEG sampling rate
-    python pipeline_valence_arousal.py --epoch-sec 4      # EEG epoch length (s)
-    python pipeline_valence_arousal.py --no-eeg           # audio + physio only
+    python pipeline_valence_arousal.py                          # default RF, 5-fold
+    python pipeline_valence_arousal.py --model mlp              # MLP regressor
+    python pipeline_valence_arousal.py --n 10                   # limit participants
+    python pipeline_valence_arousal.py --no-eeg                 # audio + physio only
+    python pipeline_valence_arousal.py --protocol AUDIO2        # switch protocol
 """
 
 from __future__ import annotations
@@ -60,6 +59,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Physio feature columns extracted from features_arousal CSV
+# (excludes time, video, start, end, markers, ratings, predicted label, reliability)
+_PHYSIO_COLS = [
+    "meanRR_30", "RMSSD_30", "SDNN_30",
+    "meanRR_10", "RMSSD_10", "SDNN_10",
+    "SCL_mean", "SCL_rate",
+    "SCR_n", "SCR_amplitude_sum", "SCR_amplitude_mean", "SCR_amplitude_max",
+    "saccade_rate_hz", "peak_saccade_velocity_deg_s", "mean_saccade_velocity_deg_s",
+    "mean_saccade_velocity_deg_s_z", "peak_saccade_velocity_deg_s_z", "saccade_rate_hz_z",
+    "pupil_diam_L_interp_mean", "pupil_diam_L_interp_z_mean", "pupil_diam_L_interp_std",
+    "RR", "Ti", "Te", "Ttot", "IE_ratio",
+]
+
 
 # ---------------------------------------------------------------------------
 # Lazy local imports
@@ -77,20 +89,10 @@ def _import_features_multimedia():
 
 def _import_features_physiology():
     try:
-        from features_physiology import (
-            extract_eeg_bendr_features,
-            load_bendr_encoder,
-            load_eeg_from_bytes,
-            load_precomputed_physio,
-        )
+        from features_physiology import extract_eeg_bendr_features, load_bendr_encoder, load_eeg_from_bytes
     except ImportError:
-        from .features_physiology import (  # type: ignore[no-redef]
-            extract_eeg_bendr_features,
-            load_bendr_encoder,
-            load_eeg_from_bytes,
-            load_precomputed_physio,
-        )
-    return load_bendr_encoder, extract_eeg_bendr_features, load_eeg_from_bytes, load_precomputed_physio
+        from .features_physiology import extract_eeg_bendr_features, load_bendr_encoder, load_eeg_from_bytes  # type: ignore[no-redef]
+    return load_bendr_encoder, extract_eeg_bendr_features, load_eeg_from_bytes
 
 
 def _import_fusion():
@@ -104,96 +106,143 @@ def _import_fusion():
 def _import_azure():
     try:
         from azure_blob import build_client, make_sas_url
-        from config import (
-            AZURE_CONTAINER_NAME, AZURE_EEG_PREFIX, AZURE_LABELS_PREFIX,
-            AZURE_PHYSIO_PREFIX, AZURE_VIDEO_PREFIX,
-        )
+        from config import AZURE_CONTAINER_NAME, AZURE_VIDEO_PREFIX
     except ImportError:
         from .azure_blob import build_client, make_sas_url  # type: ignore[no-redef]
-        from .config import (  # type: ignore[no-redef]
-            AZURE_CONTAINER_NAME, AZURE_EEG_PREFIX, AZURE_LABELS_PREFIX,
-            AZURE_PHYSIO_PREFIX, AZURE_VIDEO_PREFIX,
-        )
-    return (build_client, make_sas_url, AZURE_CONTAINER_NAME,
-            AZURE_VIDEO_PREFIX, AZURE_EEG_PREFIX,
-            AZURE_PHYSIO_PREFIX, AZURE_LABELS_PREFIX)
+        from .config import AZURE_CONTAINER_NAME, AZURE_VIDEO_PREFIX  # type: ignore[no-redef]
+    return build_client, make_sas_url, AZURE_CONTAINER_NAME, AZURE_VIDEO_PREFIX
 
 
 # ===========================================================================
-# Azure data loaders
+# Step 1 — Load physio features + labels from features_arousal files
 # ===========================================================================
 
-def _load_labels(container_client, labels_prefix: str) -> pd.DataFrame:
-    """Download the valence/arousal labels CSV from Azure.
+def _load_stimulus_physio_labels(
+    container_client,
+    protocol: str,
+    n_participants: int | None = None,
+) -> pd.DataFrame:
+    """Load all features_arousal CSVs and return one row per (participant, stimulus).
 
-    Returns a DataFrame with columns:
-        participant_id, stimulus_id, valence, arousal
+    Each row contains:
+        participant  — participant ID (e.g. P0290)
+        video        — stimulus filename (e.g. vomit_1.mp4)
+        valence      — mean rating_valence for the stimulus window
+        arousal      — mean rating_arousal for the stimulus window
+        <physio cols>— mean of each physio feature over the stimulus window
     """
-    blobs = [b.name for b in container_client.list_blobs(name_starts_with=labels_prefix)
-             if b.name.endswith(".csv")]
-    if not blobs:
-        raise FileNotFoundError(f"No label CSV found under '{labels_prefix}'")
+    prefix  = f"NEURO/{protocol}/auxiliary_signals"
+    records = []
 
-    data = container_client.download_blob(blobs[0]).readall()
-    df   = pd.read_csv(io.BytesIO(data))
-    df.columns = df.columns.str.strip().str.lower()
+    # Collect participant blob groups
+    participant_blobs: dict[str, list[str]] = {}
+    for b in container_client.list_blobs(name_starts_with=prefix):
+        if "features_arousal" not in b.name or not b.name.endswith(".csv"):
+            continue
+        parts       = b.name[len(prefix):].lstrip("/").split("/")
+        participant = parts[0] if parts else "unknown"
+        participant_blobs.setdefault(participant, []).append(b.name)
 
-    for col in ("participant_id", "stimulus_id", "valence", "arousal"):
-        if col not in df.columns:
-            raise ValueError(f"Labels CSV missing required column '{col}'")
+    participants = list(participant_blobs.keys())
+    if n_participants:
+        participants = participants[:n_participants]
 
-    for col in ("valence", "arousal"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        if df[col].max() > 1.5:
-            df[col] = (df[col] - 5.0) / 4.0   # [1,9] → [-1,1]
+    log.info("Loading physio/labels from %d participants…", len(participants))
 
-    df = df.dropna(subset=["valence", "arousal"])
-    log.info("Loaded %d label rows from '%s'", len(df), blobs[0])
-    return df
+    for pid in participants:
+        for blob_name in participant_blobs[pid]:
+            try:
+                raw = container_client.download_blob(blob_name).readall()
+                df  = pd.read_csv(io.BytesIO(raw))
+                df.columns = df.columns.str.strip()
 
+                # Keep only rows where the participant is watching a stimulus
+                stim = df[df["video"].notna()].copy()
+                if stim.empty:
+                    continue
+
+                # Average physio features + labels per stimulus (video)
+                available_physio = [c for c in _PHYSIO_COLS if c in stim.columns]
+                agg_cols         = available_physio + ["rating_valence", "rating_arousal"]
+                grouped          = stim.groupby("video")[agg_cols].mean().reset_index()
+                grouped.insert(0, "participant", pid)
+                records.append(grouped)
+
+            except Exception as exc:
+                log.warning("Failed to load %s: %s", blob_name, exc)
+
+    if not records:
+        raise ValueError(
+            f"No stimulus rows found under '{prefix}'. "
+            "Check that features_arousal CSVs have non-NaN 'video' rows."
+        )
+
+    result = pd.concat(records, ignore_index=True)
+    result = result.dropna(subset=["rating_valence", "rating_arousal"])
+
+    # Normalise ratings from [1,9] to [-1,1] if needed
+    for col in ("rating_valence", "rating_arousal"):
+        result[col] = pd.to_numeric(result[col], errors="coerce")
+        if result[col].max() > 1.5:
+            result[col] = (result[col] - 5.0) / 4.0
+
+    log.info("Physio/label table: %d rows × %d physio features  "
+             "(%d unique stimuli, %d unique participants)",
+             len(result), len([c for c in _PHYSIO_COLS if c in result.columns]),
+             result["video"].nunique(), result["participant"].nunique())
+    return result
+
+
+# ===========================================================================
+# Step 2 — Audio features  (extracted from video stimulus files)
+# ===========================================================================
 
 def _load_audio_features(
     container_client,
     video_prefix: str,
-    stimulus_ids: list[str],
+    stimulus_names: list[str],
     make_sas_url_fn,
     client,
-    container_name: str,
 ) -> dict[str, np.ndarray]:
-    """Stream audio blobs and extract 13 librosa-based acoustic features.
+    """Extract acoustic features from the video stimulus files.
 
-    Returns ``{stimulus_id: feature_vector}`` (length-13 float32 arrays).
+    Stimulus names (e.g. ``vomit_1.mp4``) are matched against blobs under
+    ``video_prefix`` by stem.  PyAV extracts the audio track from the video.
+
+    Returns ``{stimulus_name: feature_vector}`` (float32, length 13).
     """
     extract_acoustic_features, load_audio = _import_features_multimedia()
 
-    exts  = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
-    blobs = {
-        Path(b.name).stem.lower(): b.name
-        for b in container_client.list_blobs(name_starts_with=video_prefix)
-        if Path(b.name).suffix.lower() in exts
-    }
+    # Index: stem_lower → blob name
+    blob_index: dict[str, str] = {}
+    for b in container_client.list_blobs(name_starts_with=video_prefix):
+        blob_index[Path(b.name).stem.lower()] = b.name
 
     result: dict[str, np.ndarray] = {}
-    for sid in stimulus_ids:
-        blob_name = blobs.get(sid.lower())
+    missing = []
+
+    for sname in stimulus_names:
+        stem      = Path(sname).stem.lower()
+        blob_name = blob_index.get(stem)
         if blob_name is None:
-            log.warning("Audio not found for stimulus '%s'", sid)
+            missing.append(sname)
             continue
         try:
             url          = make_sas_url_fn(client, blob_name)
             waveform, sr = load_audio(url)
             feats        = extract_acoustic_features(waveform, sr)
-            result[sid]  = _acoustic_to_vector(feats)
+            result[sname] = _acoustic_to_vector(feats)
         except Exception as exc:
-            log.warning("Audio feature extraction failed for '%s': %s", sid, exc)
+            log.warning("Audio extraction failed for '%s': %s", sname, exc)
 
-    log.info("Audio features extracted for %d / %d stimuli",
-             len(result), len(stimulus_ids))
+    if missing:
+        log.warning("Audio blobs not found for %d stimuli: %s…",
+                    len(missing), missing[:5])
+    log.info("Audio features: %d / %d stimuli", len(result), len(stimulus_names))
     return result
 
 
 def _acoustic_to_vector(feats) -> np.ndarray:
-    """Flatten an AcousticFeatures object to a 1-D float32 vector."""
     return np.array([
         feats.rms_energy_mean, feats.rms_energy_max, feats.initial_energy_ratio,
         feats.energy_slope, feats.peak_position_ratio, feats.energy_variance,
@@ -204,50 +253,62 @@ def _acoustic_to_vector(feats) -> np.ndarray:
     ], dtype=np.float32)
 
 
+# ===========================================================================
+# Step 3 — EEG features  (BENDR per participant)
+# ===========================================================================
+
 def _load_eeg_features(
     container_client,
-    eeg_prefix: str,
-    stimulus_ids: list[str],
+    protocol: str,
+    participants: list[str],
     encoder,
     device: str,
     eeg_fs: float,
     epoch_sec: float,
 ) -> dict[str, np.ndarray]:
-    """Download raw EEG CSVs, encode with BENDR, return mean embedding per stimulus.
+    """Load deepclean EEG per participant and encode with BENDR.
 
-    Returns ``{stimulus_id: embedding_vector}`` (mean-pooled across epochs).
+    Returns ``{participant_id: mean_embedding_vector}``.  The whole-session
+    mean is used here; per-stimulus alignment can be added when marker data
+    is parsed.
     """
-    _, extract_eeg_bendr_features, load_eeg_from_bytes, _ = _import_features_physiology()
+    load_bendr_encoder, extract_eeg_bendr_features, load_eeg_from_bytes = _import_features_physiology()
+    prefix = f"NEURO/{protocol}/deepclean"
 
-    blobs: dict[str, str] = {
-        Path(b.name).stem.lower(): b.name
-        for b in container_client.list_blobs(name_starts_with=eeg_prefix)
-        if b.name.endswith(".csv")
-    }
+    # Index: participant → list of EEG blob names
+    part_blobs: dict[str, list[str]] = {}
+    for b in container_client.list_blobs(name_starts_with=prefix):
+        if not b.name.endswith(".csv"):
+            continue
+        rel  = b.name[len(prefix):].lstrip("/")
+        pid  = rel.split("/")[0]
+        part_blobs.setdefault(pid, []).append(b.name)
 
     result: dict[str, np.ndarray] = {}
-    for sid in stimulus_ids:
-        blob_name = blobs.get(sid.lower())
-        if blob_name is None:
-            log.warning("EEG not found for stimulus '%s'", sid)
+    for pid in participants:
+        blobs = part_blobs.get(pid)
+        if not blobs:
+            log.warning("EEG not found for participant '%s'", pid)
             continue
-        try:
-            raw        = container_client.download_blob(blob_name).readall()
-            eeg        = load_eeg_from_bytes(raw, eeg_fs)
-            eeg        = _preprocess_eeg(eeg, eeg_fs)
-            embs       = extract_eeg_bendr_features(eeg, eeg_fs, encoder, device,
+        embeddings: list[np.ndarray] = []
+        for blob_name in blobs[:1]:   # use first recording per participant
+            try:
+                raw    = container_client.download_blob(blob_name).readall()
+                eeg    = load_eeg_from_bytes(raw, eeg_fs)
+                eeg    = _preprocess_eeg(eeg, eeg_fs)
+                embs   = extract_eeg_bendr_features(eeg, eeg_fs, encoder, device,
                                                     epoch_sec=epoch_sec)
-            result[sid] = embs.mean(axis=0)   # mean across epochs → (D,)
-        except Exception as exc:
-            log.warning("EEG feature extraction failed for '%s': %s", sid, exc)
+                embeddings.append(embs.mean(axis=0))
+            except Exception as exc:
+                log.warning("EEG extraction failed for '%s': %s", pid, exc)
+        if embeddings:
+            result[pid] = np.mean(embeddings, axis=0)
 
-    log.info("EEG features extracted for %d / %d stimuli",
-             len(result), len(stimulus_ids))
+    log.info("EEG features: %d / %d participants", len(result), len(participants))
     return result
 
 
 def _preprocess_eeg(eeg: np.ndarray, fs: float) -> np.ndarray:
-    """Standard EEG preprocessing: bandpass 0.5-45 Hz + z-score per channel."""
     try:
         from features_physiology import bandpass_filter, zscore_signal
     except ImportError:
@@ -255,150 +316,87 @@ def _preprocess_eeg(eeg: np.ndarray, fs: float) -> np.ndarray:
     return zscore_signal(bandpass_filter(eeg, 0.5, 45.0, fs))
 
 
-def _load_physio_features(
-    container_client,
-    physio_prefix: str,
-    stimulus_ids: list[str],
-) -> dict[str, np.ndarray]:
-    """Download auxiliary-signal CSVs/NPYs from Azure.
-
-    Blob layout::
-
-        <physio_prefix>/<participant>/<file>.csv   (e.g. auxiliary_signals/P0290/stim01.csv)
-
-    Matching strategy (tried in order):
-      1. ``<participant>/<stem>`` — e.g. ``p0290/stim01``
-      2. Stem only               — e.g. ``stim01``
-      3. Stem contains stimulus  — partial substring match
-
-    Returns ``{stimulus_id: feature_vector}``.
-    """
-    _, _, _, load_precomputed_physio = _import_features_physiology()
-
-    # Build two indices from the blob listing
-    stem_to_blob: dict[str, str]          = {}   # stem-only → blob name
-    part_stem_to_blob: dict[str, str]     = {}   # participant/stem → blob name
-
-    for b in container_client.list_blobs(name_starts_with=physio_prefix):
-        if not b.name.endswith((".csv", ".npy")):
-            continue
-        # Strip the prefix to get the relative path: <participant>/<file>
-        rel  = b.name[len(physio_prefix):].lstrip("/")
-        stem = Path(rel).stem.lower()
-        stem_to_blob[stem] = b.name
-        # participant/stem key (e.g. "p0290/stim01")
-        parts = rel.split("/")
-        if len(parts) >= 2:
-            part_stem = f"{parts[0].lower()}/{stem}"
-            part_stem_to_blob[part_stem] = b.name
-
-    result: dict[str, np.ndarray] = {}
-    for sid in stimulus_ids:
-        sid_lower = sid.lower()
-
-        # Try matches in priority order
-        blob_name = (
-            part_stem_to_blob.get(sid_lower)          # participant/stem
-            or stem_to_blob.get(sid_lower)             # stem only
-            or next((v for k, v in stem_to_blob.items() if sid_lower in k), None)  # substring
-        )
-
-        if blob_name is None:
-            log.warning("Auxiliary physio not found for stimulus '%s'", sid)
-            continue
-        try:
-            raw         = container_client.download_blob(blob_name).readall()
-            result[sid] = load_precomputed_physio(raw)
-        except Exception as exc:
-            log.warning("Physio load failed for '%s': %s", sid, exc)
-
-    log.info("Precomputed physio loaded for %d / %d stimuli",
-             len(result), len(stimulus_ids))
-    return result
-
-
 # ===========================================================================
-# Dataset assembly
+# Step 4 — Build fused feature matrix
 # ===========================================================================
 
 def _build_dataset(
-    labels: pd.DataFrame,
+    stimulus_df: pd.DataFrame,
     audio_feats: dict[str, np.ndarray],
     eeg_feats: dict[str, np.ndarray],
-    physio_feats: dict[str, np.ndarray],
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Join all feature dicts with the labels table.
+    use_eeg: bool,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Join physio, audio, and EEG features into a single matrix.
 
     Returns:
         X     — float32 ``(n_samples, n_features)``
         y     — float32 ``(n_samples, 2)``  [valence, arousal]
-        sids  — list of stimulus IDs (same order as rows)
+        meta  — DataFrame with participant / video columns (same row order)
     """
     early_fusion_concat = _import_fusion()
+    physio_cols         = [c for c in _PHYSIO_COLS if c in stimulus_df.columns]
 
-    X_rows, y_rows, sids = [], [], []
-    for _, row in labels.iterrows():
-        sid   = str(row["stimulus_id"]).strip().lower()
-        a_vec = audio_feats.get(sid)
-        e_vec = eeg_feats.get(sid)
-        p_vec = physio_feats.get(sid)
+    X_rows, y_rows, meta_rows = [], [], []
 
-        missing = [m for m, v in [("audio", a_vec), ("EEG", e_vec), ("physio", p_vec)]
-                   if v is None]
-        if missing:
-            log.debug("Skipping '%s' — missing: %s", sid, missing)
+    for _, row in stimulus_df.iterrows():
+        pid   = row["participant"]
+        sname = row["video"]
+
+        a_vec = audio_feats.get(sname)
+        if a_vec is None:
+            log.debug("Skipping %s/%s — no audio", pid, sname)
             continue
 
-        X_rows.append(early_fusion_concat([a_vec, e_vec, p_vec]))
-        y_rows.append([float(row["valence"]), float(row["arousal"])])
-        sids.append(sid)
+        p_vec = row[physio_cols].values.astype(np.float32)
+        if np.isnan(p_vec).all():
+            log.debug("Skipping %s/%s — all physio NaN", pid, sname)
+            continue
+        p_vec = np.nan_to_num(p_vec, nan=0.0)
+
+        if use_eeg:
+            e_vec = eeg_feats.get(pid)
+            if e_vec is None:
+                log.debug("Skipping %s/%s — no EEG", pid, sname)
+                continue
+            fused = early_fusion_concat([a_vec, p_vec, e_vec])
+        else:
+            fused = early_fusion_concat([a_vec, p_vec])
+
+        X_rows.append(fused)
+        y_rows.append([float(row["rating_valence"]), float(row["rating_arousal"])])
+        meta_rows.append({"participant": pid, "video": sname})
 
     if not X_rows:
         raise ValueError(
-            "No samples could be assembled — verify that stimulus_id values in "
-            "the labels CSV match the blob file stems."
+            "No samples assembled — check that audio blobs match the video "
+            "names in the features_arousal CSVs."
         )
 
-    X = np.stack(X_rows).astype(np.float32)
-    y = np.array(y_rows, dtype=np.float32)
+    X    = np.stack(X_rows).astype(np.float32)
+    y    = np.array(y_rows, dtype=np.float32)
+    meta = pd.DataFrame(meta_rows)
+
     log.info("Dataset: %d samples × %d features  (valence + arousal targets)",
              X.shape[0], X.shape[1])
-    return X, y, sids
+    return X, y, meta
 
 
 # ===========================================================================
-# Model training and evaluation
+# Step 5 — Train and evaluate
 # ===========================================================================
 
 def _build_model(model_type: str = "rf"):
-    """Return a scikit-learn MultiOutputRegressor pipeline.
-
-    ``"rf"``  — Random Forest (robust baseline)
-    ``"mlp"`` — Multi-layer Perceptron
-    """
     if model_type == "mlp":
         from sklearn.neural_network import MLPRegressor
-        base = MLPRegressor(
-            hidden_layer_sizes=(256, 128, 64),
-            activation="relu",
-            max_iter=500,
-            random_state=42,
-            early_stopping=True,
-            validation_fraction=0.1,
-        )
+        base = MLPRegressor(hidden_layer_sizes=(256, 128, 64), activation="relu",
+                            max_iter=500, random_state=42,
+                            early_stopping=True, validation_fraction=0.1)
     else:
         from sklearn.ensemble import RandomForestRegressor
-        base = RandomForestRegressor(
-            n_estimators=200,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-
-    return Pipeline([
-        ("scaler", StandardScaler()),
-        ("model",  MultiOutputRegressor(base)),
-    ])
+        base = RandomForestRegressor(n_estimators=200, min_samples_leaf=2,
+                                     random_state=42, n_jobs=-1)
+    return Pipeline([("scaler", StandardScaler()),
+                     ("model",  MultiOutputRegressor(base))])
 
 
 def _train_and_evaluate(
@@ -407,25 +405,20 @@ def _train_and_evaluate(
     model_type: str = "rf",
     n_folds: int = 5,
 ) -> dict:
-    """Cross-validate the regressor and report per-target metrics.
-
-    Uses ``cross_val_predict`` so every sample appears exactly once in the
-    test set.  Finally fits the model on the full dataset and returns it.
-    """
     model  = _build_model(model_type)
     cv     = KFold(n_splits=n_folds, shuffle=True, random_state=42)
     y_pred = cross_val_predict(model, X, y, cv=cv)
 
     log.info("\n── Cross-validated results (%d-fold, model=%s) ──", n_folds, model_type)
     log.info("%-10s  %8s  %8s  %10s", "Target", "MSE", "R²", "Pearson r")
-    log.info("%-10s  %8s  %8s  %10s", "─" * 10, "─" * 8, "─" * 8, "─" * 10)
+    log.info("%-10s  %8s  %8s  %10s", "─"*10, "─"*8, "─"*8, "─"*10)
 
     metrics: dict[str, dict] = {}
     for i, tgt in enumerate(("valence", "arousal")):
         mse = float(mean_squared_error(y[:, i], y_pred[:, i]))
         r2  = float(r2_score(y[:, i], y_pred[:, i]))
         pr  = float(pearsonr(y[:, i], y_pred[:, i])[0])
-        metrics[tgt] = {"mse": round(mse, 4), "r2": round(r2, 4), "pearson_r": round(pr, 4)}
+        metrics[tgt] = {"mse": round(mse,4), "r2": round(r2,4), "pearson_r": round(pr,4)}
         log.info("%-10s  %8.4f  %8.4f  %10.4f", tgt, mse, r2, pr)
 
     model.fit(X, y)
@@ -438,75 +431,62 @@ def _train_and_evaluate(
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Multimodal valence/arousal pipeline (audio + EEG/BENDR + physio).",
+        description="Multimodal valence/arousal pipeline (audio + physio + EEG/BENDR).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--model",     default="rf", choices=["rf", "mlp"],
-                   help="Regressor: 'rf' (Random Forest) or 'mlp' (default: rf)")
+    p.add_argument("--protocol",  default="protocolaudio",
+                   help="NEURO sub-protocol folder (default: protocolaudio)")
+    p.add_argument("--model",     default="rf", choices=["rf", "mlp"])
     p.add_argument("--n",         type=int, default=None,
                    help="Limit to N participants")
-    p.add_argument("--folds",     type=int, default=5,
-                   help="Cross-validation folds (default: 5)")
-    p.add_argument("--eeg-fs",    type=float, default=250.0,
-                   help="EEG sampling rate in Hz (default: 250)")
-    p.add_argument("--epoch-sec", type=float, default=4.0,
-                   help="EEG epoch length in seconds (default: 4)")
+    p.add_argument("--folds",     type=int, default=5)
+    p.add_argument("--eeg-fs",    type=float, default=250.0)
+    p.add_argument("--epoch-sec", type=float, default=4.0)
     p.add_argument("--no-eeg",    action="store_true",
-                   help="Skip EEG — use audio + precomputed physio only")
+                   help="Use audio + physio only (skip EEG/BENDR)")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    build_client, make_sas_url, CONTAINER, VIDEO_PREFIX = _import_azure()
 
-    (build_client, make_sas_url, CONTAINER, AUDIO_PFX,
-     EEG_PFX, PHYSIO_PFX, LABELS_PFX) = _import_azure()
-
-    log.info("Connecting to Azure (container: %s)…", CONTAINER)
+    log.info("Protocol : %s  |  container : %s", args.protocol, CONTAINER)
     client = build_client()
     cc     = client.get_container_client(CONTAINER)
 
-    # 1. Labels
-    labels = _load_labels(cc, LABELS_PFX)
-    if args.n:
-        parts  = labels["participant_id"].unique()[:args.n]
-        labels = labels[labels["participant_id"].isin(parts)]
-        log.info("Restricted to %d participants (%d stimuli)",
-                 len(parts), len(labels))
+    # 1. Physio features + labels from features_arousal CSVs
+    log.info("Loading physio features and ratings from auxiliary_signals…")
+    stim_df = _load_stimulus_physio_labels(cc, args.protocol, n_participants=args.n)
 
-    stimulus_ids = labels["stimulus_id"].astype(str).str.strip().str.lower().unique().tolist()
-    log.info("Unique stimuli to process: %d", len(stimulus_ids))
+    stimulus_names = stim_df["video"].unique().tolist()
+    participants   = stim_df["participant"].unique().tolist()
 
-    # 2. Audio features
-    log.info("Extracting audio features…")
-    audio_feats = _load_audio_features(cc, AUDIO_PFX, stimulus_ids,
-                                       make_sas_url, client, CONTAINER)
+    # 2. Audio features from video stimulus files
+    log.info("Extracting audio features from %d unique stimuli…", len(stimulus_names))
+    audio_feats = _load_audio_features(
+        cc, VIDEO_PREFIX, stimulus_names, make_sas_url, client
+    )
 
-    # 3. EEG features (BENDR)
-    if args.no_eeg:
-        log.info("EEG modality skipped (--no-eeg).")
-        eeg_feats = {sid: np.zeros(512, dtype=np.float32) for sid in audio_feats}
-    else:
+    # 3. EEG features (optional)
+    eeg_feats: dict[str, np.ndarray] = {}
+    if not args.no_eeg:
         log.info("Loading BENDR encoder…")
         encoder, device = _import_features_physiology()[0](pretrained=True)
-        log.info("Extracting EEG features (fs=%.0f Hz, epoch=%.1f s)…",
-                 args.eeg_fs, args.epoch_sec)
-        eeg_feats = _load_eeg_features(cc, EEG_PFX, stimulus_ids,
-                                       encoder, device,
-                                       args.eeg_fs, args.epoch_sec)
+        log.info("Extracting EEG features for %d participants…", len(participants))
+        eeg_feats = _load_eeg_features(
+            cc, args.protocol, participants, encoder, device,
+            args.eeg_fs, args.epoch_sec
+        )
 
-    # 4. Precomputed non-EEG physio
-    log.info("Loading precomputed physiological features…")
-    physio_feats = _load_physio_features(cc, PHYSIO_PFX, stimulus_ids)
+    # 4. Assemble fused dataset
+    log.info("Assembling feature matrix…")
+    X, y, meta = _build_dataset(stim_df, audio_feats, eeg_feats,
+                                 use_eeg=not args.no_eeg)
 
-    # 5. Assemble multimodal feature matrix
-    log.info("Assembling multimodal feature matrix…")
-    X, y, _ = _build_dataset(labels, audio_feats, eeg_feats, physio_feats)
-
-    # 6. Train and evaluate
+    # 5. Train and evaluate
     log.info("Training %s regressor (%d-fold CV)…", args.model.upper(), args.folds)
     result = _train_and_evaluate(X, y, model_type=args.model, n_folds=args.folds)
-
     log.info("Done.  Metrics: %s", result["metrics"])
 
 
