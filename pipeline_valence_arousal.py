@@ -9,16 +9,15 @@ Modalities
     EEG           → deep embeddings (BENDR pretrained contextual encoder)
     Non-EEG physio→ precomputed feature vectors (pupil, ECG, EDA, …)
 
-All data is streamed from Azure Blob Storage (silver container) via SAS URLs
-or DefaultAzureCredential.  When credentials are absent the script falls back
-to fully synthetic data so the pipeline can be exercised locally.
+All data is streamed from Azure Blob Storage (silver container) via
+DefaultAzureCredential or a connection-string.
 
 Azure data layout (silver container)
 -------------------------------------
-    NEURO/protocolimage/categories/<category>/<stimulus>.wav   ← audio
+    NEURO/protocolimage/categories/<category>/<stimulus>.wav       ← audio
     NEURO/physiological/eeg/<participant>/<session>/<stimulus>.csv ← raw EEG
     NEURO/physiological/precomputed/<participant>/<stimulus>.csv   ← physio
-    NEURO/labels/valence_arousal.csv                              ← labels
+    NEURO/labels/valence_arousal.csv                               ← labels
 
 Labels CSV columns
 ------------------
@@ -27,12 +26,12 @@ Labels CSV columns
 
 Usage
 -----
-    python pipeline_valence_arousal.py                    # Azure run
-    python pipeline_valence_arousal.py --synthetic        # local test
-    python pipeline_valence_arousal.py --model mlp        # model choice (rf/mlp)
-    python pipeline_valence_arousal.py --n 50             # limit participants
+    python pipeline_valence_arousal.py                    # default (RF, 5-fold)
+    python pipeline_valence_arousal.py --model mlp        # MLP regressor
+    python pipeline_valence_arousal.py --n 50             # limit to 50 participants
     python pipeline_valence_arousal.py --eeg-fs 250       # EEG sampling rate
     python pipeline_valence_arousal.py --epoch-sec 4      # EEG epoch length (s)
+    python pipeline_valence_arousal.py --no-eeg           # audio + physio only
 """
 
 from __future__ import annotations
@@ -59,8 +58,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Lazy local imports (keeps startup fast; heavy deps loaded only when needed)
+# Lazy local imports
 # ---------------------------------------------------------------------------
 
 def _import_features_multimedia():
@@ -140,7 +140,6 @@ def _load_labels(container_client, labels_prefix: str) -> pd.DataFrame:
         if col not in df.columns:
             raise ValueError(f"Labels CSV missing required column '{col}'")
 
-    # Normalise valence/arousal to [-1, 1] if they appear to be in [1, 9]
     for col in ("valence", "arousal"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
         if df[col].max() > 1.5:
@@ -165,8 +164,8 @@ def _load_audio_features(
     """
     extract_acoustic_features, load_audio = _import_features_multimedia()
 
-    exts   = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
-    blobs  = {
+    exts  = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+    blobs = {
         Path(b.name).stem.lower(): b.name
         for b in container_client.list_blobs(name_starts_with=video_prefix)
         if Path(b.name).suffix.lower() in exts
@@ -179,10 +178,10 @@ def _load_audio_features(
             log.warning("Audio not found for stimulus '%s'", sid)
             continue
         try:
-            url              = make_sas_url_fn(client, blob_name)
-            waveform, sr     = load_audio(url)
-            feats            = extract_acoustic_features(waveform, sr)
-            result[sid]      = _acoustic_to_vector(feats)
+            url          = make_sas_url_fn(client, blob_name)
+            waveform, sr = load_audio(url)
+            feats        = extract_acoustic_features(waveform, sr)
+            result[sid]  = _acoustic_to_vector(feats)
         except Exception as exc:
             log.warning("Audio feature extraction failed for '%s': %s", sid, exc)
 
@@ -193,15 +192,14 @@ def _load_audio_features(
 
 def _acoustic_to_vector(feats) -> np.ndarray:
     """Flatten an AcousticFeatures object to a 1-D float32 vector."""
-    fields = [
+    return np.array([
         feats.rms_energy_mean, feats.rms_energy_max, feats.initial_energy_ratio,
         feats.energy_slope, feats.peak_position_ratio, feats.energy_variance,
         feats.loudness_dynamic_range_db, *feats.loudness_shape_5seg,
         feats.zero_crossing_rate_mean, feats.zero_crossing_rate_var,
         feats.spectral_centroid_mean_hz, feats.onset_density_per_second,
         feats.pause_ratio,
-    ]
-    return np.array(fields, dtype=np.float32)
+    ], dtype=np.float32)
 
 
 def _load_eeg_features(
@@ -232,11 +230,11 @@ def _load_eeg_features(
             log.warning("EEG not found for stimulus '%s'", sid)
             continue
         try:
-            raw      = container_client.download_blob(blob_name).readall()
-            eeg      = load_eeg_from_bytes(raw, eeg_fs)
-            eeg      = _preprocess_eeg(eeg, eeg_fs)
-            embs     = extract_eeg_bendr_features(eeg, eeg_fs, encoder, device,
-                                                   epoch_sec=epoch_sec)
+            raw        = container_client.download_blob(blob_name).readall()
+            eeg        = load_eeg_from_bytes(raw, eeg_fs)
+            eeg        = _preprocess_eeg(eeg, eeg_fs)
+            embs       = extract_eeg_bendr_features(eeg, eeg_fs, encoder, device,
+                                                    epoch_sec=epoch_sec)
             result[sid] = embs.mean(axis=0)   # mean across epochs → (D,)
         except Exception as exc:
             log.warning("EEG feature extraction failed for '%s': %s", sid, exc)
@@ -247,13 +245,12 @@ def _load_eeg_features(
 
 
 def _preprocess_eeg(eeg: np.ndarray, fs: float) -> np.ndarray:
-    """Standard EEG preprocessing: bandpass 0.5-45 Hz + z-score."""
+    """Standard EEG preprocessing: bandpass 0.5-45 Hz + z-score per channel."""
     try:
         from features_physiology import bandpass_filter, zscore_signal
     except ImportError:
         from .features_physiology import bandpass_filter, zscore_signal  # type: ignore[no-redef]
-    eeg = bandpass_filter(eeg, 0.5, 45.0, fs)
-    return zscore_signal(eeg)
+    return zscore_signal(bandpass_filter(eeg, 0.5, 45.0, fs))
 
 
 def _load_physio_features(
@@ -261,7 +258,7 @@ def _load_physio_features(
     physio_prefix: str,
     stimulus_ids: list[str],
 ) -> dict[str, np.ndarray]:
-    """Download precomputed non-EEG physio feature CSVs from Azure.
+    """Download precomputed non-EEG physio feature CSVs/NPYs from Azure.
 
     Returns ``{stimulus_id: feature_vector}``.
     """
@@ -280,8 +277,8 @@ def _load_physio_features(
             log.warning("Precomputed physio not found for stimulus '%s'", sid)
             continue
         try:
-            raw          = container_client.download_blob(blob_name).readall()
-            result[sid]  = load_precomputed_physio(raw)
+            raw         = container_client.download_blob(blob_name).readall()
+            result[sid] = load_precomputed_physio(raw)
         except Exception as exc:
             log.warning("Physio load failed for '%s': %s", sid, exc)
 
@@ -303,36 +300,32 @@ def _build_dataset(
     """Join all feature dicts with the labels table.
 
     Returns:
-        X     — float32 array ``(n_samples, n_features)``
-        y     — float32 array ``(n_samples, 2)``  [valence, arousal]
+        X     — float32 ``(n_samples, n_features)``
+        y     — float32 ``(n_samples, 2)``  [valence, arousal]
         sids  — list of stimulus IDs (same order as rows)
     """
     early_fusion_concat = _import_fusion()
 
     X_rows, y_rows, sids = [], [], []
-
     for _, row in labels.iterrows():
-        sid = str(row["stimulus_id"]).strip().lower()
-
+        sid   = str(row["stimulus_id"]).strip().lower()
         a_vec = audio_feats.get(sid)
         e_vec = eeg_feats.get(sid)
         p_vec = physio_feats.get(sid)
 
-        # Skip samples with missing modalities
         missing = [m for m, v in [("audio", a_vec), ("EEG", e_vec), ("physio", p_vec)]
                    if v is None]
         if missing:
             log.debug("Skipping '%s' — missing: %s", sid, missing)
             continue
 
-        fused = early_fusion_concat([a_vec, e_vec, p_vec])
-        X_rows.append(fused)
+        X_rows.append(early_fusion_concat([a_vec, e_vec, p_vec]))
         y_rows.append([float(row["valence"]), float(row["arousal"])])
         sids.append(sid)
 
     if not X_rows:
         raise ValueError(
-            "No samples could be assembled — check that stimulus_id values in "
+            "No samples could be assembled — verify that stimulus_id values in "
             "the labels CSV match the blob file stems."
         )
 
@@ -350,9 +343,8 @@ def _build_dataset(
 def _build_model(model_type: str = "rf"):
     """Return a scikit-learn MultiOutputRegressor pipeline.
 
-    Choices:
-        ``"rf"``  — Random Forest (robust baseline, no hyperparameter tuning needed)
-        ``"mlp"`` — Multi-layer Perceptron (fits more complex patterns)
+    ``"rf"``  — Random Forest (robust baseline)
+    ``"mlp"`` — Multi-layer Perceptron
     """
     if model_type == "mlp":
         from sklearn.neural_network import MLPRegressor
@@ -368,7 +360,6 @@ def _build_model(model_type: str = "rf"):
         from sklearn.ensemble import RandomForestRegressor
         base = RandomForestRegressor(
             n_estimators=200,
-            max_depth=None,
             min_samples_leaf=2,
             random_state=42,
             n_jobs=-1,
@@ -386,126 +377,72 @@ def _train_and_evaluate(
     model_type: str = "rf",
     n_folds: int = 5,
 ) -> dict:
-    """Train and cross-validate the regressor.  Reports per-target metrics.
+    """Cross-validate the regressor and report per-target metrics.
 
-    Uses ``cross_val_predict`` for out-of-fold predictions so every sample
-    appears exactly once in the test set.
-
-    Returns a dict with ``valence`` and ``arousal`` sub-dicts, each containing
-    ``mse``, ``r2``, and ``pearson_r``.
+    Uses ``cross_val_predict`` so every sample appears exactly once in the
+    test set.  Finally fits the model on the full dataset and returns it.
     """
-    model   = _build_model(model_type)
-    cv      = KFold(n_splits=n_folds, shuffle=True, random_state=42)
-    y_pred  = cross_val_predict(model, X, y, cv=cv)
-
-    targets = ["valence", "arousal"]
-    metrics: dict[str, dict] = {}
+    model  = _build_model(model_type)
+    cv     = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+    y_pred = cross_val_predict(model, X, y, cv=cv)
 
     log.info("\n── Cross-validated results (%d-fold, model=%s) ──", n_folds, model_type)
     log.info("%-10s  %8s  %8s  %10s", "Target", "MSE", "R²", "Pearson r")
     log.info("%-10s  %8s  %8s  %10s", "─" * 10, "─" * 8, "─" * 8, "─" * 10)
 
-    for i, tgt in enumerate(targets):
-        mse  = float(mean_squared_error(y[:, i], y_pred[:, i]))
-        r2   = float(r2_score(y[:, i], y_pred[:, i]))
-        pr   = float(pearsonr(y[:, i], y_pred[:, i])[0])
+    metrics: dict[str, dict] = {}
+    for i, tgt in enumerate(("valence", "arousal")):
+        mse = float(mean_squared_error(y[:, i], y_pred[:, i]))
+        r2  = float(r2_score(y[:, i], y_pred[:, i]))
+        pr  = float(pearsonr(y[:, i], y_pred[:, i])[0])
         metrics[tgt] = {"mse": round(mse, 4), "r2": round(r2, 4), "pearson_r": round(pr, 4)}
         log.info("%-10s  %8.4f  %8.4f  %10.4f", tgt, mse, r2, pr)
 
-    # Fit on the full dataset and return the trained model
     model.fit(X, y)
     return {"model": model, "metrics": metrics}
 
 
 # ===========================================================================
-# Synthetic fallback  (no Azure credentials needed)
-# ===========================================================================
-
-def _synthetic_dataset(
-    n_samples: int = 100,
-    audio_dim: int = 13,
-    eeg_dim: int = 512,
-    physio_dim: int = 32,
-    seed: int = 42,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Generate a synthetic multimodal dataset for local pipeline testing.
-
-    The feature vectors are random Gaussian noise; the targets are a
-    sinusoidal function of the first two audio features (so the model has
-    something non-trivial to learn).
-    """
-    rng   = np.random.default_rng(seed)
-    n_feat = audio_dim + eeg_dim + physio_dim
-
-    X = rng.standard_normal((n_samples, n_feat)).astype(np.float32)
-
-    # Ground-truth valence/arousal with a learnable structure
-    t       = np.linspace(0, 4 * np.pi, n_samples)
-    valence = np.sin(t) * 0.6 + X[:, 0] * 0.1
-    arousal = np.cos(t) * 0.6 + X[:, 1] * 0.1
-    y = np.stack([valence, arousal], axis=1).astype(np.float32)
-
-    log.info(
-        "Synthetic dataset: %d samples × %d features "
-        "(audio=%d, EEG=%d, physio=%d)",
-        n_samples, n_feat, audio_dim, eeg_dim, physio_dim,
-    )
-    return X, y
-
-
-# ===========================================================================
-# Main
+# CLI and main
 # ===========================================================================
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Multimodal valence/arousal pipeline (audio + EEG + physio).",
+        description="Multimodal valence/arousal pipeline (audio + EEG/BENDR + physio).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--synthetic", action="store_true",
-                   help="Use synthetic data (no Azure credentials needed)")
     p.add_argument("--model",     default="rf", choices=["rf", "mlp"],
                    help="Regressor: 'rf' (Random Forest) or 'mlp' (default: rf)")
     p.add_argument("--n",         type=int, default=None,
                    help="Limit to N participants")
     p.add_argument("--folds",     type=int, default=5,
-                   help="Number of cross-validation folds (default: 5)")
+                   help="Cross-validation folds (default: 5)")
     p.add_argument("--eeg-fs",    type=float, default=250.0,
                    help="EEG sampling rate in Hz (default: 250)")
     p.add_argument("--epoch-sec", type=float, default=4.0,
                    help="EEG epoch length in seconds (default: 4)")
     p.add_argument("--no-eeg",    action="store_true",
-                   help="Skip EEG modality (use audio + physio only)")
-    p.add_argument("--synthetic-n", type=int, default=100,
-                   help="Number of synthetic samples (default: 100)")
+                   help="Skip EEG — use audio + precomputed physio only")
     return p.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # ── Synthetic mode ───────────────────────────────────────────────────────
-    if args.synthetic:
-        log.info("Running in SYNTHETIC mode — no Azure connection required.")
-        X, y = _synthetic_dataset(n_samples=args.synthetic_n)
-        _train_and_evaluate(X, y, model_type=args.model, n_folds=args.folds)
-        return
-
-    # ── Azure mode ───────────────────────────────────────────────────────────
     (build_client, make_sas_url, CONTAINER, AUDIO_PFX,
      EEG_PFX, PHYSIO_PFX, LABELS_PFX) = _import_azure()
 
     log.info("Connecting to Azure (container: %s)…", CONTAINER)
-    client   = build_client()
-    cc       = client.get_container_client(CONTAINER)
+    client = build_client()
+    cc     = client.get_container_client(CONTAINER)
 
     # 1. Labels
     labels = _load_labels(cc, LABELS_PFX)
     if args.n:
-        participants = labels["participant_id"].unique()[:args.n]
-        labels       = labels[labels["participant_id"].isin(participants)]
+        parts  = labels["participant_id"].unique()[:args.n]
+        labels = labels[labels["participant_id"].isin(parts)]
         log.info("Restricted to %d participants (%d stimuli)",
-                 len(participants), len(labels))
+                 len(parts), len(labels))
 
     stimulus_ids = labels["stimulus_id"].astype(str).str.strip().str.lower().unique().tolist()
     log.info("Unique stimuli to process: %d", len(stimulus_ids))
@@ -517,15 +454,12 @@ def main() -> None:
 
     # 3. EEG features (BENDR)
     if args.no_eeg:
-        log.info("Skipping EEG modality.")
-        # Zero-pad EEG slot so dataset assembly still works
-        dummy_dim  = 512
-        eeg_feats  = {sid: np.zeros(dummy_dim, dtype=np.float32)
-                      for sid in audio_feats}
+        log.info("EEG modality skipped (--no-eeg).")
+        eeg_feats = {sid: np.zeros(512, dtype=np.float32) for sid in audio_feats}
     else:
         log.info("Loading BENDR encoder…")
         encoder, device = _import_features_physiology()[0](pretrained=True)
-        log.info("Extracting EEG features (fs=%.0f Hz, epoch=%.1fs)…",
+        log.info("Extracting EEG features (fs=%.0f Hz, epoch=%.1f s)…",
                  args.eeg_fs, args.epoch_sec)
         eeg_feats = _load_eeg_features(cc, EEG_PFX, stimulus_ids,
                                        encoder, device,
@@ -535,7 +469,7 @@ def main() -> None:
     log.info("Loading precomputed physiological features…")
     physio_feats = _load_physio_features(cc, PHYSIO_PFX, stimulus_ids)
 
-    # 5. Build fused dataset
+    # 5. Assemble multimodal feature matrix
     log.info("Assembling multimodal feature matrix…")
     X, y, _ = _build_dataset(labels, audio_feats, eeg_feats, physio_feats)
 
@@ -543,7 +477,7 @@ def main() -> None:
     log.info("Training %s regressor (%d-fold CV)…", args.model.upper(), args.folds)
     result = _train_and_evaluate(X, y, model_type=args.model, n_folds=args.folds)
 
-    log.info("Done.  Final metrics: %s", result["metrics"])
+    log.info("Done.  Metrics: %s", result["metrics"])
 
 
 if __name__ == "__main__":
