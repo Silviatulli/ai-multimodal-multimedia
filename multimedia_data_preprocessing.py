@@ -222,8 +222,181 @@ def build_video_index(categories_dir: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Audio
 # ---------------------------------------------------------------------------
-# TODO: add audio preprocessing functions
-# Suggested: get_audio_info, load_audio, get_audio_windows, augment_audio
+
+# Validation error hierarchy — maps to spec error codes
+class AudioValidationError(Exception):
+    """Base class for audio input validation failures."""
+    code = "PROCESSING_ERROR"
+
+class InvalidFormatError(AudioValidationError):
+    """Unsupported extension or file that cannot be decoded as audio."""
+    code = "INVALID_FORMAT"
+
+class EmptyFileError(AudioValidationError):
+    """File is missing or has zero bytes."""
+    code = "EMPTY_FILE"
+
+class FileTooLargeError(AudioValidationError):
+    """File exceeds the maximum allowed size."""
+    code = "FILE_TOO_LARGE"
+
+class DurationExceededError(AudioValidationError):
+    """Decoded audio is longer than the maximum allowed duration."""
+    code = "DURATION_EXCEEDED"
+
+
+# Audio loading constants
+AUDIO_TARGET_SR: int   = 16_000
+AUDIO_MAX_DURATION_S   = 600.0          # 10 minutes
+AUDIO_MAX_FILE_BYTES   = 500 * 1024 * 1024   # 500 MB
+AUDIO_TARGET_LUFS      = -23.0
+AUDIO_ALLOWED_EXTENSIONS = {
+    ".wav", ".mp3", ".m4a", ".aac", ".flac",
+    ".ogg", ".opus", ".wma", ".webm",
+}
+
+
+def load_audio(
+    path: str,
+    target_sr: int = AUDIO_TARGET_SR,
+    mono: bool = True,
+    lufs_normalize: bool = True,
+) -> tuple[np.ndarray, int]:
+    """Load and validate an audio file, returning a normalised waveform.
+
+    Validates extension, file size, and decoded duration before returning.
+    When *lufs_normalize* is True, the waveform is LUFS-normalised to
+    ``AUDIO_TARGET_LUFS`` (skipped for clips too short to measure or silence).
+
+    Args:
+        path:           Path to the audio file.
+        target_sr:      Target sample rate in Hz (default 16 000).
+        mono:           Mix down to mono (default True).
+        lufs_normalize: Apply LUFS loudness normalisation (default True).
+
+    Returns:
+        ``(waveform, sample_rate)`` — float32 numpy array, always *target_sr*.
+
+    Raises:
+        InvalidFormatError, EmptyFileError, FileTooLargeError,
+        DurationExceededError.
+    """
+    import librosa
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if p.suffix.lower() not in AUDIO_ALLOWED_EXTENSIONS:
+        raise InvalidFormatError(
+            f"unsupported extension {p.suffix!r}; "
+            f"allowed: {sorted(AUDIO_ALLOWED_EXTENSIONS)}"
+        )
+    if not p.is_file() or p.stat().st_size == 0:
+        raise EmptyFileError(f"file is missing or empty: {p}")
+    if p.stat().st_size > AUDIO_MAX_FILE_BYTES:
+        raise FileTooLargeError(
+            f"file size {p.stat().st_size} bytes exceeds "
+            f"limit of {AUDIO_MAX_FILE_BYTES} bytes"
+        )
+
+    try:
+        waveform, sr = librosa.load(path, sr=target_sr, mono=mono)
+    except Exception as exc:
+        logger.exception("load_audio: failed to decode %s", p.name)
+        raise InvalidFormatError(f"could not decode audio: {p.name}") from exc
+
+    waveform = np.asarray(waveform, dtype=np.float32)
+    duration_s = len(waveform) / sr
+    if duration_s > AUDIO_MAX_DURATION_S:
+        raise DurationExceededError(
+            f"duration {duration_s:.2f}s exceeds limit of {AUDIO_MAX_DURATION_S}s"
+        )
+
+    if lufs_normalize:
+        waveform = _lufs_normalize(waveform, sr)
+    return waveform.astype(np.float32), sr
+
+
+def _lufs_normalize(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+    """LUFS-normalise to ``AUDIO_TARGET_LUFS``; return unchanged if not measurable."""
+    try:
+        import pyloudnorm as pyln
+        meter = pyln.Meter(sample_rate)
+        if len(waveform) < meter.block_size * sample_rate:
+            logger.warning("_lufs_normalize: clip too short, skipping")
+            return waveform
+        loudness = meter.integrated_loudness(waveform)
+        if not np.isfinite(loudness):
+            logger.warning("_lufs_normalize: non-finite loudness, skipping")
+            return waveform
+        return pyln.normalize.loudness(waveform, loudness, AUDIO_TARGET_LUFS)
+    except ImportError:
+        logger.warning("_lufs_normalize: pyloudnorm not installed, skipping")
+        return waveform
+
+
+def get_audio_info(audio_path: str) -> tuple[int, int, float]:
+    """Return ``(sample_rate, n_channels, duration_sec)`` for an audio file."""
+    container    = av.open(audio_path)
+    stream       = container.streams.audio[0]
+    sample_rate  = stream.sample_rate or 0
+    n_channels   = stream.channels or 1
+    duration_sec = (
+        float(stream.duration * stream.time_base)
+        if stream.duration else 0.0
+    )
+    container.close()
+    return sample_rate, n_channels, duration_sec
+
+
+def get_audio_windows(
+    audio_path: str,
+    window_size_sec: float = WINDOW_SIZE_SEC,
+    stride_sec: float = WINDOW_STRIDE_SEC,
+    target_sr: int = AUDIO_TARGET_SR,
+    mono: bool = True,
+) -> list[dict]:
+    """Slide a window over an audio file and return one dict per segment.
+
+    Each dict contains: ``start_sec``, ``end_sec``, ``waveform`` (float32).
+    The last window is zero-padded to *window_size_sec* if the clip is shorter.
+    """
+    waveform, _ = load_audio(audio_path, target_sr=target_sr, mono=mono)
+    total_samples  = waveform.shape[-1]
+    win_samples    = int(window_size_sec * target_sr)
+    stride_samples = max(1, int(stride_sec * target_sr))
+
+    windows: list[dict] = []
+    start = 0
+    while start < total_samples:
+        end     = min(start + win_samples, total_samples)
+        segment = waveform[..., start:end]
+        if segment.shape[-1] < win_samples:
+            pad     = win_samples - segment.shape[-1]
+            segment = np.pad(segment, (0, pad))
+        windows.append({
+            "start_sec": start / target_sr,
+            "end_sec":   end   / target_sr,
+            "waveform":  segment,
+        })
+        if end >= total_samples:
+            break
+        start += stride_samples
+    return windows
+
+
+def augment_audio(
+    waveform: np.ndarray,
+    gain_range: tuple = (0.8, 1.2),
+    noise_std: float = 0.005,
+) -> np.ndarray:
+    """Apply random gain jitter and additive Gaussian noise to a waveform.
+
+    Both transforms are label-preserving and help reduce recording-level
+    loudness as a confound in affective analysis.
+    """
+    waveform = waveform * np.random.uniform(*gain_range)
+    waveform = waveform + np.random.normal(0, noise_std, waveform.shape)
+    return np.clip(waveform, -1.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +410,87 @@ def build_video_index(categories_dir: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Text
 # ---------------------------------------------------------------------------
-# TODO: add text preprocessing functions
-# Suggested: clean_text, chunk_text, tokenize_text
+
+def clean_text(text: str) -> str:
+    """Normalise Unicode (NFC), collapse whitespace, and strip control characters.
+
+    Handles typical OCR noise: arbitrary line breaks, missing punctuation gaps,
+    and non-printable control characters are all removed or collapsed.
+    """
+    import re
+    import unicodedata
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 512,
+    overlap: int = 64,
+    tokenizer=None,
+) -> list[str]:
+    """Split *text* into overlapping chunks of at most *chunk_size* tokens.
+
+    When *tokenizer* is ``None`` (default), splits by whitespace-separated
+    words.  Pass a HuggingFace tokenizer to split by subword tokens instead,
+    which respects model vocabulary boundaries.
+
+    Args:
+        text:       Input text string.
+        chunk_size: Maximum number of tokens (words or subwords) per chunk.
+        overlap:    Number of tokens shared between consecutive chunks.
+        tokenizer:  Optional HuggingFace tokenizer.
+
+    Returns:
+        List of text strings, each at most *chunk_size* tokens long.
+    """
+    text = clean_text(text)
+    if tokenizer is not None:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        chunks: list[str] = []
+        start = 0
+        while start < len(token_ids):
+            end = min(start + chunk_size, len(token_ids))
+            chunks.append(tokenizer.decode(token_ids[start:end]))
+            if end == len(token_ids):
+                break
+            start += chunk_size - overlap
+        return chunks
+
+    words = text.split()
+    chunks, start = [], 0
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start += chunk_size - overlap
+    return chunks
+
+
+def tokenize_text(
+    text: str,
+    tokenizer,
+    max_length: int = 512,
+    padding: str = "max_length",
+    truncation: bool = True,
+) -> dict:
+    """Run a HuggingFace *tokenizer* on *text* and return the encoding dict.
+
+    Returns ``input_ids``, ``attention_mask``, and any other fields the
+    tokenizer produces, all as plain Python lists (no framework tensors).
+    """
+    text = clean_text(text)
+    encoding = tokenizer(
+        text,
+        max_length=max_length,
+        padding=padding,
+        truncation=truncation,
+        return_tensors=None,
+    )
+    return dict(encoding)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +498,75 @@ def build_video_index(categories_dir: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # TODO: add web/HTML preprocessing functions
 # Suggested: parse_html, extract_text_from_url
+
+
+# ---------------------------------------------------------------------------
+# Video — pre-extraction modes (for Azure ML parallel jobs)
+# ---------------------------------------------------------------------------
+
+def _resize_frame(frame: np.ndarray, size: int) -> np.ndarray:
+    """Resize *frame* (H×W×3) to *size*×*size* using bilinear interpolation."""
+    from PIL import Image
+    return np.array(
+        Image.fromarray(frame).resize((size, size), Image.BILINEAR),
+        dtype=np.uint8,
+    )
+
+
+def preprocess_video_whole(
+    video_path: str,
+    num_frames: int = NUM_FRAMES,
+    size: int = 224,
+) -> np.ndarray:
+    """Decode *num_frames* uniformly-sampled frames from the full clip.
+
+    Returns a uint8 array of shape ``[T, H, W, C]`` (T = num_frames,
+    H = W = size).  This is the format expected by ``CachedVideoDataset``
+    when frames are pre-extracted for the training loop.
+    """
+    raw_frames = sample_frames(video_path, num_frames=num_frames)
+    return np.stack([_resize_frame(f, size) for f in raw_frames], axis=0)
+
+
+def preprocess_video_per_second(
+    video_path: str,
+    num_frames: int = NUM_FRAMES,
+    size: int = 224,
+) -> list[dict]:
+    """Decode *num_frames* from each non-overlapping 1-second window of the clip.
+
+    Returns a list of dicts, one per second, each with keys:
+    - ``second``      — 0-based integer second index
+    - ``start_frame`` — first frame index of the window
+    - ``end_frame``   — last frame index (exclusive)
+    - ``frames``      — uint8 array ``[T, H, W, C]``
+
+    Used by ``TemporalLabelDataset`` when oculometry labels are at per-second
+    granularity.  Mirrors the ``per_second`` mode of
+    ``scripts/preprocess_videos.py`` in ai-occulo-video-insights.
+    """
+    fps, total_frames, _ = get_video_info(video_path)
+    if fps <= 0 or total_frames == 0:
+        return []
+
+    frames_per_sec = max(num_frames, int(round(fps)))
+    n_seconds      = max(1, int(total_frames / fps))
+
+    results: list[dict] = []
+    for sec in range(n_seconds):
+        start_frame = int(round(sec * fps))
+        end_frame   = min(int(round((sec + 1) * fps)), total_frames)
+        raw_frames  = sample_frames_from_segment(
+            video_path, start_frame, end_frame, num_frames=num_frames
+        )
+        arr = np.stack([_resize_frame(f, size) for f in raw_frames], axis=0)
+        results.append({
+            "second":      sec,
+            "start_frame": start_frame,
+            "end_frame":   end_frame,
+            "frames":      arr,
+        })
+    return results
 
 
 # ---------------------------------------------------------------------------
