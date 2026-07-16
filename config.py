@@ -30,9 +30,16 @@ AZURE_VIDEO_PREFIX: str       = os.getenv("AZURE_VIDEO_PREFIX",  "NEURO/protocol
 AZURE_OUTPUT_PREFIX: str      = os.getenv("AZURE_OUTPUT_PREFIX", "AI/protocolimage/preprocessed")
 
 # ── Physiological data paths ─────────────────────────────────────────────────
-# EEG raw CSVs:               silver/NEURO/physiological/eeg/<participant>/<session>/<stimulus>.csv
-# Precomputed non-EEG physio: silver/NEURO/physiological/precomputed/<participant>/<stimulus>.csv
-# Valence / arousal labels:   silver/NEURO/labels/valence_arousal.csv
-AZURE_EEG_PREFIX: str         = os.getenv("AZURE_EEG_PREFIX",    "NEURO/physiological/eeg")
-AZURE_PHYSIO_PREFIX: str      = os.getenv("AZURE_PHYSIO_PREFIX",  "NEURO/physiological/precomputed")
-AZURE_LABELS_PREFIX: str      = os.getenv("AZURE_LABELS_PREFIX",  "NEURO/labels")
+# Auxiliary (non-EEG) signals live inside each protocol folder:
+#   silver/NEURO/<protocol>/auxiliary_signals/<participant>/<file>
+# Set AZURE_PROTOCOL to select the protocol (default: protocolaudio).
+#
+# EEG raw CSVs:             silver/NEURO/<protocol>/eeg/<participant>/<file>.csv
+# Labels:                   silver/NEURO/<protocol>/labels/valence_arousal.csv
+AZURE_PROTOCOL: str           = os.getenv("AZURE_PROTOCOL",       "protocolaudio")
+AZURE_EEG_PREFIX: str         = os.getenv("AZURE_EEG_PREFIX",
+                                           f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/eeg")
+AZURE_PHYSIO_PREFIX: str      = os.getenv("AZURE_PHYSIO_PREFIX",
+                                           f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/auxiliary_signals")
+AZURE_LABELS_PREFIX: str      = os.getenv("AZURE_LABELS_PREFIX",
+                                           f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/labels")

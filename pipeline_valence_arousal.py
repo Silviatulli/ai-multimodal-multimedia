@@ -12,12 +12,14 @@ Modalities
 All data is streamed from Azure Blob Storage (silver container) via
 DefaultAzureCredential or a connection-string.
 
-Azure data layout (silver container)
--------------------------------------
-    NEURO/protocolimage/categories/<category>/<stimulus>.wav       ← audio
-    NEURO/physiological/eeg/<participant>/<session>/<stimulus>.csv ← raw EEG
-    NEURO/physiological/precomputed/<participant>/<stimulus>.csv   ← physio
-    NEURO/labels/valence_arousal.csv                               ← labels
+Azure data layout (silver container, default: protocolaudio)
+-------------------------------------------------------------
+    NEURO/protocolimage/categories/<category>/<stimulus>.wav              ← audio
+    NEURO/<protocol>/eeg/<participant>/<stimulus>.csv                     ← raw EEG
+    NEURO/<protocol>/auxiliary_signals/<participant>/<stimulus>.csv       ← physio
+    NEURO/<protocol>/labels/valence_arousal.csv                           ← labels
+
+Set AZURE_PROTOCOL env var to switch protocols (e.g. protocolaudio, protocolimage).
 
 Labels CSV columns
 ------------------
@@ -258,23 +260,51 @@ def _load_physio_features(
     physio_prefix: str,
     stimulus_ids: list[str],
 ) -> dict[str, np.ndarray]:
-    """Download precomputed non-EEG physio feature CSVs/NPYs from Azure.
+    """Download auxiliary-signal CSVs/NPYs from Azure.
+
+    Blob layout::
+
+        <physio_prefix>/<participant>/<file>.csv   (e.g. auxiliary_signals/P0290/stim01.csv)
+
+    Matching strategy (tried in order):
+      1. ``<participant>/<stem>`` — e.g. ``p0290/stim01``
+      2. Stem only               — e.g. ``stim01``
+      3. Stem contains stimulus  — partial substring match
 
     Returns ``{stimulus_id: feature_vector}``.
     """
     _, _, _, load_precomputed_physio = _import_features_physiology()
 
-    blobs: dict[str, str] = {
-        Path(b.name).stem.lower(): b.name
-        for b in container_client.list_blobs(name_starts_with=physio_prefix)
-        if b.name.endswith((".csv", ".npy"))
-    }
+    # Build two indices from the blob listing
+    stem_to_blob: dict[str, str]          = {}   # stem-only → blob name
+    part_stem_to_blob: dict[str, str]     = {}   # participant/stem → blob name
+
+    for b in container_client.list_blobs(name_starts_with=physio_prefix):
+        if not b.name.endswith((".csv", ".npy")):
+            continue
+        # Strip the prefix to get the relative path: <participant>/<file>
+        rel  = b.name[len(physio_prefix):].lstrip("/")
+        stem = Path(rel).stem.lower()
+        stem_to_blob[stem] = b.name
+        # participant/stem key (e.g. "p0290/stim01")
+        parts = rel.split("/")
+        if len(parts) >= 2:
+            part_stem = f"{parts[0].lower()}/{stem}"
+            part_stem_to_blob[part_stem] = b.name
 
     result: dict[str, np.ndarray] = {}
     for sid in stimulus_ids:
-        blob_name = blobs.get(sid.lower())
+        sid_lower = sid.lower()
+
+        # Try matches in priority order
+        blob_name = (
+            part_stem_to_blob.get(sid_lower)          # participant/stem
+            or stem_to_blob.get(sid_lower)             # stem only
+            or next((v for k, v in stem_to_blob.items() if sid_lower in k), None)  # substring
+        )
+
         if blob_name is None:
-            log.warning("Precomputed physio not found for stimulus '%s'", sid)
+            log.warning("Auxiliary physio not found for stimulus '%s'", sid)
             continue
         try:
             raw         = container_client.download_blob(blob_name).readall()
