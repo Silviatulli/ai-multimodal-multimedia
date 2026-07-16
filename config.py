@@ -28,3 +28,11 @@ AZURE_CONNECTION_STRING: str  = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
 AZURE_CONTAINER_NAME: str     = os.getenv("AZURE_CONTAINER_NAME", "silver")
 AZURE_VIDEO_PREFIX: str       = os.getenv("AZURE_VIDEO_PREFIX",  "NEURO/protocolimage/categories")
 AZURE_OUTPUT_PREFIX: str      = os.getenv("AZURE_OUTPUT_PREFIX", "AI/protocolimage/preprocessed")
+
+# ── Physiological data paths ─────────────────────────────────────────────────
+# EEG raw CSVs:               silver/NEURO/physiological/eeg/<participant>/<session>/<stimulus>.csv
+# Precomputed non-EEG physio: silver/NEURO/physiological/precomputed/<participant>/<stimulus>.csv
+# Valence / arousal labels:   silver/NEURO/labels/valence_arousal.csv
+AZURE_EEG_PREFIX: str         = os.getenv("AZURE_EEG_PREFIX",    "NEURO/physiological/eeg")
+AZURE_PHYSIO_PREFIX: str      = os.getenv("AZURE_PHYSIO_PREFIX",  "NEURO/physiological/precomputed")
+AZURE_LABELS_PREFIX: str      = os.getenv("AZURE_LABELS_PREFIX",  "NEURO/labels")
