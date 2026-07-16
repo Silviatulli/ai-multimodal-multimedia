@@ -15,7 +15,7 @@ DefaultAzureCredential or a connection-string.
 Azure data layout (silver container, default: protocolaudio)
 -------------------------------------------------------------
     NEURO/protocolimage/categories/<category>/<stimulus>.wav              ← audio
-    NEURO/<protocol>/eeg/<participant>/<stimulus>.csv                     ← raw EEG
+    NEURO/<protocol>/deepclean2/<participant>/<stimulus>.csv              ← clean EEG
     NEURO/<protocol>/auxiliary_signals/<participant>/<stimulus>.csv       ← physio
     NEURO/<protocol>/labels/valence_arousal.csv                           ← labels
 

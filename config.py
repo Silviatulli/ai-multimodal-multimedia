@@ -38,7 +38,7 @@ AZURE_OUTPUT_PREFIX: str      = os.getenv("AZURE_OUTPUT_PREFIX", "AI/protocolima
 # Labels:                   silver/NEURO/<protocol>/labels/valence_arousal.csv
 AZURE_PROTOCOL: str           = os.getenv("AZURE_PROTOCOL",       "protocolaudio")
 AZURE_EEG_PREFIX: str         = os.getenv("AZURE_EEG_PREFIX",
-                                           f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/eeg")
+                                           f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/deepclean2")
 AZURE_PHYSIO_PREFIX: str      = os.getenv("AZURE_PHYSIO_PREFIX",
                                            f"NEURO/{os.getenv('AZURE_PROTOCOL', 'protocolaudio')}/auxiliary_signals")
 AZURE_LABELS_PREFIX: str      = os.getenv("AZURE_LABELS_PREFIX",
