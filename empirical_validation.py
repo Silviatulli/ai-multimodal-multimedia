@@ -364,3 +364,320 @@ def aggregate_distance_stats(distance_dir: str) -> dict[str, dict[str, float]]:
         }
 
     return stats
+
+
+# ===========================================================================
+# Affective label validation  (valence / arousal ratings)
+# ===========================================================================
+
+def compute_icc(
+    df: "pd.DataFrame",
+    target: str,
+    rater_col: str = "ID",
+    item_col: str  = "video",
+) -> dict:
+    """Compute ICC(2,1) — two-way random, single measures — for continuous ratings.
+
+    ICC(2,1) measures absolute agreement between raters across items. It is
+    the standard metric for inter-rater reliability with continuous affective
+    labels (valence, arousal).
+
+    Uses ``pingouin`` when available; falls back to a manual ANOVA-based
+    implementation otherwise.
+
+    Returns a dict with: ``icc``, ``F``, ``df1``, ``df2``, ``pval``,
+    ``ci95_lower``, ``ci95_upper``, ``interpretation``.
+    """
+    import pandas as pd
+    import numpy as np
+    from scipy import stats as _stats
+
+    sub = df[[rater_col, item_col, target]].dropna()
+
+    try:
+        import pingouin as pg  # type: ignore[import]
+        res = pg.intraclass_corr(
+            data=sub, targets=item_col, raters=rater_col, ratings=target
+        )
+        row = res[res["Type"] == "ICC2"].iloc[0]
+        icc_val = float(row["ICC"])
+        return {
+            "icc":           round(icc_val, 4),
+            "F":             round(float(row["F"]), 4),
+            "df1":           int(row["df1"]),
+            "df2":           int(row["df2"]),
+            "pval":          float(row["pval"]),
+            "ci95_lower":    round(float(row["CI95%"][0]), 4),
+            "ci95_upper":    round(float(row["CI95%"][1]), 4),
+            "interpretation": _icc_label(icc_val),
+        }
+    except ImportError:
+        pass  # fallback below
+
+    # Manual one-way ANOVA decomposition (ICC(1,1) approximation)
+    pivot  = sub.pivot_table(index=item_col, columns=rater_col, values=target)
+    k      = pivot.shape[1]          # number of raters
+    n      = pivot.shape[0]          # number of items
+    grand  = pivot.values
+    ms_row = np.nanvar(np.nanmean(grand, axis=1)) * k
+    ms_err = np.nanmean(np.nanvar(grand, axis=0, ddof=1))
+    icc_val = (ms_row - ms_err) / (ms_row + (k - 1) * ms_err)
+    icc_val = float(np.clip(icc_val, -1, 1))
+    F_val  = ms_row / ms_err if ms_err > 0 else float("nan")
+    return {
+        "icc":           round(icc_val, 4),
+        "F":             round(F_val, 4),
+        "df1":           int(n - 1),
+        "df2":           int(n * (k - 1)),
+        "pval":          float("nan"),
+        "ci95_lower":    float("nan"),
+        "ci95_upper":    float("nan"),
+        "interpretation": _icc_label(icc_val),
+    }
+
+
+def _icc_label(icc: float) -> str:
+    if icc < 0.50: return "poor"
+    if icc < 0.75: return "moderate"
+    if icc < 0.90: return "good"
+    return "excellent"
+
+
+def rating_distribution_stats(
+    df: "pd.DataFrame",
+    targets: list[str] = ("rating_valence", "rating_arousal"),
+    rater_col: str = "ID",
+    item_col: str  = "video",
+) -> dict:
+    """Descriptive statistics for each rating target.
+
+    Returns per-target dicts with global stats, per-rater means, and
+    per-stimulus variance (as a measure of crowd agreement).
+    """
+    import pandas as pd
+    from scipy.stats import skew, kurtosis
+
+    result = {}
+    for tgt in targets:
+        sub = df[[rater_col, item_col, tgt]].dropna()
+        vals = sub[tgt].values
+
+        per_rater   = sub.groupby(rater_col)[tgt].mean().to_dict()
+        per_stim_sd = sub.groupby(item_col)[tgt].std()
+        mean_disagreement = float(per_stim_sd.mean())
+        most_contested    = per_stim_sd.idxmax() if len(per_stim_sd) else None
+        most_agreed       = per_stim_sd.idxmin() if len(per_stim_sd) else None
+
+        result[tgt] = {
+            "n_ratings":           int(len(vals)),
+            "n_raters":            int(sub[rater_col].nunique()),
+            "n_stimuli":           int(sub[item_col].nunique()),
+            "mean":                round(float(vals.mean()), 4),
+            "std":                 round(float(vals.std()), 4),
+            "min":                 round(float(vals.min()), 4),
+            "max":                 round(float(vals.max()), 4),
+            "skewness":            round(float(skew(vals)), 4),
+            "kurtosis":            round(float(kurtosis(vals)), 4),
+            "mean_inter_rater_sd": round(mean_disagreement, 4),
+            "most_contested_stim": most_contested,
+            "most_agreed_stim":    most_agreed,
+            "per_rater_mean":      {k: round(v, 4) for k, v in per_rater.items()},
+        }
+    return result
+
+
+def annotator_bias_analysis(
+    df: "pd.DataFrame",
+    targets: list[str] = ("rating_valence", "rating_arousal"),
+    rater_col: str = "ID",
+) -> "pd.DataFrame":
+    """Per-rater statistics to detect scale-usage bias.
+
+    Returns a DataFrame with one row per rater and columns:
+    mean, std, min, max, range_used (= max - min) for each target.
+    Raters using a narrow range or consistently offset from the group
+    mean are flagged as potentially biased.
+    """
+    import pandas as pd
+
+    rows = []
+    group_means = {t: df[t].mean() for t in targets if t in df.columns}
+
+    for rater, gdf in df.groupby(rater_col):
+        row = {"rater": rater, "n_ratings": len(gdf)}
+        for tgt in targets:
+            if tgt not in gdf.columns:
+                continue
+            vals     = gdf[tgt].dropna()
+            r_mean   = float(vals.mean())
+            r_std    = float(vals.std())
+            r_range  = float(vals.max() - vals.min())
+            bias     = r_mean - group_means.get(tgt, r_mean)
+            row[f"{tgt}_mean"]      = round(r_mean, 3)
+            row[f"{tgt}_std"]       = round(r_std, 3)
+            row[f"{tgt}_range"]     = round(r_range, 3)
+            row[f"{tgt}_bias"]      = round(bias, 3)
+        rows.append(row)
+
+    return pd.DataFrame(rows).set_index("rater")
+
+
+def crowd_wisdom_analysis(
+    df: "pd.DataFrame",
+    reliable_col: str = "crowd_wisdom_reliable",
+    targets: list[str] = ("rating_valence", "rating_arousal"),
+) -> dict:
+    """Compare rating statistics for crowd-wisdom-reliable vs unreliable rows.
+
+    Returns counts and per-target mean/std split by reliability flag.
+    """
+    if reliable_col not in df.columns:
+        return {"error": f"Column '{reliable_col}' not found"}
+
+    n_total    = len(df)
+    n_reliable = int(df[reliable_col].sum())
+    result     = {
+        "n_total":         n_total,
+        "n_reliable":      n_reliable,
+        "n_unreliable":    n_total - n_reliable,
+        "pct_reliable":    round(100 * n_reliable / n_total, 1),
+    }
+    for tgt in targets:
+        if tgt not in df.columns:
+            continue
+        rel   = df[df[reliable_col]  == True][tgt].dropna()
+        unrel = df[df[reliable_col]  == False][tgt].dropna()
+        result[f"{tgt}_reliable_mean"]   = round(float(rel.mean()),   4) if len(rel)   else None
+        result[f"{tgt}_reliable_std"]    = round(float(rel.std()),    4) if len(rel)   else None
+        result[f"{tgt}_unreliable_mean"] = round(float(unrel.mean()), 4) if len(unrel) else None
+        result[f"{tgt}_unreliable_std"]  = round(float(unrel.std()),  4) if len(unrel) else None
+    return result
+
+
+def validate_affective_labels(df: "pd.DataFrame") -> dict:
+    """Run the full empirical validation suite on an affective ratings DataFrame.
+
+    Expects columns: ID (rater), video (item), rating_valence, rating_arousal,
+    crowd_wisdom_reliable.
+
+    Returns a nested dict with all validation results.
+    """
+    targets = [c for c in ("rating_valence", "rating_arousal") if c in df.columns]
+
+    report: dict = {
+        "n_rows":      len(df),
+        "n_raters":    int(df["ID"].nunique()) if "ID" in df.columns else None,
+        "n_stimuli":   int(df["video"].nunique()) if "video" in df.columns else None,
+    }
+
+    logger.info("Computing rating distribution stats…")
+    report["distribution"] = rating_distribution_stats(df, targets)
+
+    logger.info("Computing inter-rater reliability (ICC)…")
+    report["icc"] = {}
+    for tgt in targets:
+        report["icc"][tgt] = compute_icc(df, tgt)
+
+    logger.info("Computing annotator bias…")
+    bias_df = annotator_bias_analysis(df, targets)
+    report["annotator_bias"] = bias_df.to_dict(orient="index")
+
+    logger.info("Crowd wisdom reliability analysis…")
+    report["crowd_wisdom"] = crowd_wisdom_analysis(df)
+
+    return report
+
+
+# ===========================================================================
+# Script entry point  — run validation against Azure
+# ===========================================================================
+
+if __name__ == "__main__":
+    import argparse
+    import io
+    import json
+    import sys
+    import logging as _logging
+
+    _logging.basicConfig(level=_logging.INFO,
+                         format="%(asctime)s  %(levelname)-8s  %(message)s",
+                         datefmt="%H:%M:%S")
+    log = _logging.getLogger(__name__)
+
+    p = argparse.ArgumentParser(
+        description="Empirical validation of affective labels from Azure."
+    )
+    p.add_argument("--protocol", default="protocolaudio",
+                   help="NEURO sub-protocol (default: protocolaudio)")
+    p.add_argument("--blob", default="auxiliary_signals/occulo_event_level_features_all.csv",
+                   help="Blob path relative to the protocol folder")
+    p.add_argument("--out", default=None,
+                   help="Optional JSON file to save the report")
+    args = p.parse_args()
+
+    try:
+        from azure_blob import build_client
+        from config import AZURE_CONTAINER_NAME
+    except ImportError:
+        from .azure_blob import build_client  # type: ignore[no-redef]
+        from .config import AZURE_CONTAINER_NAME  # type: ignore[no-redef]
+
+    import pandas as pd
+
+    client = build_client()
+    cc     = client.get_container_client(AZURE_CONTAINER_NAME)
+    blob   = f"NEURO/{args.protocol}/{args.blob}"
+
+    log.info("Loading %s …", blob)
+    data = cc.download_blob(blob).readall()
+    df   = pd.read_csv(io.BytesIO(data))
+    log.info("Loaded %d rows × %d columns", *df.shape)
+
+    report = validate_affective_labels(df)
+
+    # ── Print summary ───────────────────────────────────────────────────────
+    print(f"\n{'═'*60}")
+    print(f"  Affective Label Validation  —  {args.protocol}")
+    print(f"{'═'*60}")
+    print(f"  Ratings:   {report['n_rows']}  "
+          f"({report['n_raters']} raters × {report['n_stimuli']} stimuli)")
+
+    for tgt, stats in report["distribution"].items():
+        label = tgt.replace("rating_", "").capitalize()
+        icc   = report["icc"].get(tgt, {})
+        print(f"\n  {label}")
+        print(f"    Mean ± SD       : {stats['mean']:.3f} ± {stats['std']:.3f}  "
+              f"[{stats['min']:.2f}, {stats['max']:.2f}]")
+        print(f"    Skewness        : {stats['skewness']:.3f}  "
+              f"Kurtosis: {stats['kurtosis']:.3f}")
+        print(f"    Mean inter-rater SD : {stats['mean_inter_rater_sd']:.3f}")
+        print(f"    ICC(2,1)        : {icc.get('icc', 'n/a')}  "
+              f"({icc.get('interpretation', '')})  "
+              f"95% CI [{icc.get('ci95_lower','?')}, {icc.get('ci95_upper','?')}]")
+        print(f"    Most contested  : {stats['most_contested_stim']}")
+        print(f"    Most agreed     : {stats['most_agreed_stim']}")
+
+    cw = report["crowd_wisdom"]
+    print(f"\n  Crowd Wisdom Reliability")
+    print(f"    Reliable rows   : {cw['n_reliable']} / {cw['n_total']} "
+          f"({cw['pct_reliable']}%)")
+
+    print(f"\n  Annotator Bias  (mean ± range per rater)")
+    bias_df = pd.DataFrame(report["annotator_bias"]).T
+    for tgt in ("rating_valence", "rating_arousal"):
+        mc = f"{tgt}_mean"
+        rc = f"{tgt}_range"
+        bc = f"{tgt}_bias"
+        if mc in bias_df.columns:
+            label = tgt.replace("rating_", "").capitalize()
+            print(f"    {label}: mean range = {bias_df[rc].mean():.3f}  "
+                  f"max bias = {bias_df[bc].abs().max():.3f}")
+    print(f"{'═'*60}\n")
+
+    if args.out:
+        safe = json.loads(json.dumps(report, default=str))
+        with open(args.out, "w") as fh:
+            json.dump(safe, fh, indent=2)
+        log.info("Report saved → %s", args.out)
+
+    log.info("Done.")
