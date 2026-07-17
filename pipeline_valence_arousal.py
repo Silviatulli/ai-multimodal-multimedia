@@ -197,6 +197,28 @@ def _load_stimulus_physio_labels(
 # Step 2 — Audio features  (extracted from video stimulus files)
 # ===========================================================================
 
+def _audio_from_video_url(url: str, target_sr: int = 16_000) -> tuple[np.ndarray, int]:
+    """Extract and resample the audio track from a video URL using PyAV + librosa.
+
+    This bypasses ``load_audio()``'s extension validator so that .mp4 stimulus
+    files (which are video containers) work transparently.
+    """
+    import av
+    import librosa
+
+    container = av.open(url)
+    resampler = av.AudioResampler(format="fltp", layout="mono", rate=target_sr)
+    chunks: list[np.ndarray] = []
+    for frame in container.decode(audio=0):
+        for rf in resampler.resample(frame):
+            chunks.append(rf.to_ndarray())
+    container.close()
+    if not chunks:
+        raise ValueError(f"No audio stream found in {url}")
+    waveform = np.concatenate(chunks, axis=-1)[0].astype(np.float32)
+    return waveform, target_sr
+
+
 def _load_audio_features(
     container_client,
     video_prefix: str,
@@ -211,7 +233,7 @@ def _load_audio_features(
 
     Returns ``{stimulus_name: feature_vector}`` (float32, length 13).
     """
-    extract_acoustic_features, load_audio = _import_features_multimedia()
+    extract_acoustic_features, _ = _import_features_multimedia()
 
     # Index: stem_lower → blob name
     blob_index: dict[str, str] = {}
@@ -228,9 +250,9 @@ def _load_audio_features(
             missing.append(sname)
             continue
         try:
-            url          = make_sas_url_fn(client, blob_name)
-            waveform, sr = load_audio(url)
-            feats        = extract_acoustic_features(waveform, sr)
+            url           = make_sas_url_fn(client, blob_name)
+            waveform, sr  = _audio_from_video_url(url)
+            feats         = extract_acoustic_features(waveform, sr)
             result[sname] = _acoustic_to_vector(feats)
         except Exception as exc:
             log.warning("Audio extraction failed for '%s': %s", sname, exc)
