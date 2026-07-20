@@ -77,6 +77,45 @@ PHYSIO_COLS = [
     "RR", "Ti", "Te", "Ttot", "IE_ratio",
 ]
 
+# Per-modality physiological response latencies (seconds from stimulus onset).
+# Features are only reliable AFTER these delays — earlier windows still carry
+# the response to the previous stimulus.
+# Sources: Boucsein (2012) for GSR; Berntson et al. (1997) for ECG;
+#          Mathôt (2018) for pupil; Benedek & Kaernbach (2010) for respiration.
+MODALITY_DELAYS: dict[str, int] = {
+    # Oculometry — saccades are reflexive, near-real-time
+    "saccade_rate_hz":                    0,
+    "peak_saccade_velocity_deg_s":        0,
+    "mean_saccade_velocity_deg_s":        0,
+    "mean_saccade_velocity_deg_s_z":      0,
+    "peak_saccade_velocity_deg_s_z":      0,
+    "saccade_rate_hz_z":                  0,
+    # Pupil dilation — parasympathetic/sympathetic onset ~0.5–2 s
+    "pupil_diam_L_interp_mean":           1,
+    "pupil_diam_L_interp_z_mean":         1,
+    "pupil_diam_L_interp_std":            1,
+    # ECG / HRV — vagal response 1–3 s; 30 s window averages absorb earlier noise
+    "meanRR_30":                          2,
+    "RMSSD_30":                           2,
+    "SDNN_30":                            2,
+    "meanRR_10":                          1,
+    "RMSSD_10":                           1,
+    "SDNN_10":                            1,
+    # GSR — SCR onset 1–4 s, peak ~2–4 s; SCL is even slower
+    "SCL_mean":                           4,
+    "SCL_rate":                           4,
+    "SCR_n":                              2,
+    "SCR_amplitude_sum":                  3,
+    "SCR_amplitude_mean":                 3,
+    "SCR_amplitude_max":                  3,
+    # Respiration — cycle-level changes emerge over 2–5 s
+    "RR":                                 3,
+    "Ti":                                 3,
+    "Te":                                 3,
+    "Ttot":                               3,
+    "IE_ratio":                           3,
+}
+
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -88,13 +127,10 @@ def load_data(protocol: str = "protocolaudio",
 
     Args:
         protocol:  NEURO sub-protocol folder (e.g. ``protocolaudio``).
-        delay_sec: Minimum ``win_idx_in_trial`` for physio-derived labels.
-                   Skips early-trial windows where slow modalities (GSR,
-                   respiration, ECG) are still responding to the *previous*
-                   stimulus rather than the current one.
-                   Recommended: 0 (no delay, default)
-                                2 (pupil / ECG)
-                                3 (GSR / respiration — dominant modality)
+        delay_sec: Additional global minimum ``win_idx_in_trial`` for physio-derived
+                   *teacher labels* (applied on top of per-feature ``MODALITY_DELAYS``
+                   which already handle latency in the feature aggregation).
+                   Set to 0 (default) to rely entirely on the per-feature delays.
     """
     from azure.identity import DefaultAzureCredential
     from azure.storage.blob import BlobServiceClient
@@ -122,10 +158,29 @@ def load_data(protocol: str = "protocolaudio",
             stim = df[df["video"].notna()].copy()
             if stim.empty:
                 continue
-            stim = stim.groupby(["video", "start"]).mean(numeric_only=True).reset_index()
-            stim["participant"] = pid
-            stim["session"] = day
-            rows.append(stim)
+
+            # Apply per-modality delays: for each feature, only average windows
+            # where win_idx_in_trial >= that feature's response latency.
+            # This prevents slow modalities (GSR, respiration) from carrying
+            # response to the previous stimulus into the current trial's mean.
+            feat_cols_present = [c for c in PHYSIO_COLS if c in stim.columns]
+            agg: dict[str, float] = {"video": stim["video"].iloc[0],
+                                     "start": stim["start"].mean()}
+
+            for col in feat_cols_present:
+                delay = MODALITY_DELAYS.get(col, 0)
+                valid  = stim[stim["win_idx_in_trial"] >= delay] if "win_idx_in_trial" in stim.columns else stim
+                agg[col] = float(valid[col].mean()) if len(valid) and valid[col].notna().any() else float("nan")
+
+            # Self-report ratings — use all windows (they're constant per stimulus)
+            for rc in ("rating_valence", "rating_arousal"):
+                if rc in stim.columns:
+                    agg[rc] = float(stim[rc].mean())
+
+            row_df = pd.DataFrame([agg])
+            row_df["participant"] = pid
+            row_df["session"] = day
+            rows.append(row_df)
         except Exception as exc:
             log.debug("Skip %s: %s", fname, exc)
 
