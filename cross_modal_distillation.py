@@ -159,28 +159,33 @@ def load_data(protocol: str = "protocolaudio",
             if stim.empty:
                 continue
 
-            # Apply per-modality delays: for each feature, only average windows
-            # where win_idx_in_trial >= that feature's response latency.
-            # This prevents slow modalities (GSR, respiration) from carrying
-            # response to the previous stimulus into the current trial's mean.
-            feat_cols_present = [c for c in PHYSIO_COLS if c in stim.columns]
-            agg: dict[str, float] = {"video": stim["video"].iloc[0],
-                                     "start": stim["start"].mean()}
+            # Group by (video, start_marker) — each unique (video, start) = one stimulus trial.
+            # For each group, apply per-feature response-latency delay:
+            # only average time windows where win_idx_in_trial >= that feature's delay.
+            has_win_idx = "win_idx_in_trial" in stim.columns
+            agg_rows = []
+            for (video, start_marker), trial in stim.groupby(["video", "start"]):
+                row: dict = {"video": video, "start": start_marker}
+                for col in PHYSIO_COLS:
+                    if col not in trial.columns:
+                        continue
+                    delay = MODALITY_DELAYS.get(col, 0)
+                    if has_win_idx and delay > 0:
+                        valid = trial[trial["win_idx_in_trial"] >= delay]
+                    else:
+                        valid = trial
+                    row[col] = float(valid[col].mean()) if len(valid) and valid[col].notna().any() else float("nan")
+                for rc in ("rating_valence", "rating_arousal"):
+                    if rc in trial.columns:
+                        row[rc] = float(trial[rc].mean())
+                agg_rows.append(row)
 
-            for col in feat_cols_present:
-                delay = MODALITY_DELAYS.get(col, 0)
-                valid  = stim[stim["win_idx_in_trial"] >= delay] if "win_idx_in_trial" in stim.columns else stim
-                agg[col] = float(valid[col].mean()) if len(valid) and valid[col].notna().any() else float("nan")
-
-            # Self-report ratings — use all windows (they're constant per stimulus)
-            for rc in ("rating_valence", "rating_arousal"):
-                if rc in stim.columns:
-                    agg[rc] = float(stim[rc].mean())
-
-            row_df = pd.DataFrame([agg])
-            row_df["participant"] = pid
-            row_df["session"] = day
-            rows.append(row_df)
+            if not agg_rows:
+                continue
+            trial_df = pd.DataFrame(agg_rows)
+            trial_df["participant"] = pid
+            trial_df["session"] = day
+            rows.append(trial_df)
         except Exception as exc:
             log.debug("Skip %s: %s", fname, exc)
 
