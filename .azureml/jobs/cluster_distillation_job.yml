@@ -36,6 +36,10 @@ command: >
     set -euo pipefail
 
     echo "=========================================="
+    echo "Installing dependencies (torch + extras)..."
+    pip install torch scikit-learn azure-identity azure-storage-blob pandas numpy scipy --quiet
+
+    echo "=========================================="
     echo "Python version:"
     python --version
     echo "PyTorch version:"
@@ -43,10 +47,6 @@ command: >
     echo "Torch CUDA available:" $(python -c "import torch; print(torch.cuda.is_available())")
     echo "=========================================="
 
-    echo "Installing extra dependencies (scikit-learn, azure-identity, azure-storage-blob)..."
-    pip install scikit-learn azure-identity azure-storage-blob --quiet --no-cache-dir
-
-    echo "=========================================="
     echo "Starting cluster_distillation_comparison.py..."
     python -u cluster_distillation_comparison.py \
       --protocol    protocolaudio \
