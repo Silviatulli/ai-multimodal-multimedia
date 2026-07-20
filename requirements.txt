@@ -1,0 +1,25 @@
+# Runtime dependencies for cluster_distillation_comparison.py / cross_modal_distillation.py
+#
+# The registered AML environment azureml:gsr-modeling:7 already ships with:
+#   - Python 3.12
+#   - torch (PyTorch with CUDA support)
+#   - scikit-learn
+#   - azure-identity
+#   - azure-storage-blob
+#   - numpy
+#   - pandas
+#   - scipy
+#
+# The job command runs:
+#   pip install scikit-learn azure-identity azure-storage-blob --quiet
+# as a safety net in case any of the above are missing or outdated.
+#
+# To run locally, install all deps listed below:
+
+torch>=2.2.0
+scikit-learn>=1.4.0
+azure-identity>=1.15.0
+azure-storage-blob>=12.19.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0

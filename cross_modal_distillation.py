@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import logging
 import os
 import re
@@ -446,6 +447,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--epochs-student", type=int, default=150)
     p.add_argument("--no-distill", action="store_true",
                    help="Run student-only baseline (ignores alpha/temperature)")
+    p.add_argument("--output-dir", default=None,
+                   help="If set, write results JSON to <output-dir>/cross_modal_results.json")
     return p.parse_args()
 
 
@@ -528,6 +531,31 @@ def main() -> None:
                float(np.mean(agg["Student (baseline)"][t]["pearson_r"])))
         log.info("  KD gain — %s: ΔR²=%+.4f  ΔPearson=%+.4f  → %s",
                  t, dr2, dpr, "IMPROVED" if dr2 > 0 else "no gain")
+
+    if args.output_dir is not None:
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        summary: dict = {
+            "config": {
+                "protocol":    args.protocol,
+                "folds":       args.folds,
+                "alpha":       args.alpha,
+                "temperature": args.temperature,
+                "delay_sec":   args.delay_sec,
+                "no_distill":  args.no_distill,
+            },
+            "results": {},
+        }
+        for m in models:
+            summary["results"][m] = {}
+            for t in targets:
+                summary["results"][m][t] = {
+                    k: round(float(np.mean(agg[m][t][k])), 4)
+                    for k in metrics
+                }
+        out_path = out_dir / "cross_modal_results.json"
+        out_path.write_text(json.dumps(summary, indent=2))
+        log.info("Results saved to %s", out_path)
 
     log.info("Done.")
 
