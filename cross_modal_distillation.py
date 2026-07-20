@@ -82,8 +82,20 @@ PHYSIO_COLS = [
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(protocol: str = "protocolaudio") -> pd.DataFrame:
-    """Load and merge physio features, self-report labels, and physio-derived labels."""
+def load_data(protocol: str = "protocolaudio",
+              delay_sec: int = 0) -> tuple["pd.DataFrame", list[str]]:
+    """Load and merge physio features, self-report labels, and physio-derived labels.
+
+    Args:
+        protocol:  NEURO sub-protocol folder (e.g. ``protocolaudio``).
+        delay_sec: Minimum ``win_idx_in_trial`` for physio-derived labels.
+                   Skips early-trial windows where slow modalities (GSR,
+                   respiration, ECG) are still responding to the *previous*
+                   stimulus rather than the current one.
+                   Recommended: 0 (no delay, default)
+                                2 (pupil / ECG)
+                                3 (GSR / respiration — dominant modality)
+    """
     from azure.identity import DefaultAzureCredential
     from azure.storage.blob import BlobServiceClient
 
@@ -130,7 +142,15 @@ def load_data(protocol: str = "protocolaudio") -> pd.DataFrame:
             cc.download_blob("TARGETS/all_labels/all_arousal_emotion_video.csv").readall()
         ))
         # Keep only stimulus rows (video not NaN) and average per (participant, video)
+        # Apply delay: skip windows < delay_sec to avoid inter-stimulus carry-over
+        # in slow modalities (GSR peak at ~2-4s, respiration ~3-5s, ECG ~1-3s).
         lab_stim = lab_raw[lab_raw["video"].notna()].copy()
+        if delay_sec > 0:
+            before = len(lab_stim)
+            lab_stim = lab_stim[lab_stim["win_idx_in_trial"] >= delay_sec]
+            log.info("  Delay filter (>=%ds): %d → %d rows (%.0f%% retained)",
+                     delay_sec, before, len(lab_stim),
+                     100 * len(lab_stim) / max(before, 1))
         merged_lab = (
             lab_stim.groupby(["subject_id", "video"])
             [["arousal_three_all", "valence_three_all"]]
@@ -358,6 +378,10 @@ def _parse_args() -> argparse.Namespace:
                    help="KD loss weight (0=no distillation, 1=only KD)")
     p.add_argument("--temperature", type=float, default=3.0,
                    help="Softmax temperature for soft targets")
+    p.add_argument("--delay-sec",   type=int,   default=0,
+                   help="Skip first N seconds of each trial for physio labels "
+                        "(accounts for GSR/respiration response latency). "
+                        "Recommended: 3 for GSR-dominated 'all' labels.")
     p.add_argument("--epochs-teacher", type=int, default=100)
     p.add_argument("--epochs-student", type=int, default=150)
     p.add_argument("--no-distill", action="store_true",
@@ -371,7 +395,7 @@ def main() -> None:
         else "cuda" if torch.cuda.is_available() else "cpu"
     log.info("Device: %s", device)
 
-    data, feat_cols = load_data(args.protocol)
+    data, feat_cols = load_data(args.protocol, delay_sec=args.delay_sec)
 
     X_raw = data[feat_cols].fillna(0).values.astype(np.float32)
     y_reg = data[["rating_valence", "rating_arousal"]].values.astype(np.float32)
@@ -420,8 +444,8 @@ def main() -> None:
 
     log.info("\n" + "═" * 68)
     log.info("  Cross-Modal Knowledge Distillation  (%d-fold CV)", args.folds)
-    log.info("  alpha=%.2f  temperature=%.1f  physio_labels=%d%%",
-             args.alpha, args.temperature, pct_physio)
+    log.info("  alpha=%.2f  temperature=%.1f  physio_labels=%d%%  delay=%ds",
+             args.alpha, args.temperature, pct_physio, args.delay_sec)
     log.info("═" * 68)
     log.info("%-24s  %-10s  %8s  %8s  %10s",
              "Model", "Target", "MSE", "R²", "Pearson r")
