@@ -33,6 +33,7 @@ try:
         AZURE_CONNECTION_STRING,
         AZURE_CONTAINER_NAME,
         AZURE_OUTPUT_PREFIX,
+        AZURE_STORAGE_ACCOUNT,
         AZURE_VIDEO_PREFIX,
     )
 except ImportError:
@@ -40,6 +41,7 @@ except ImportError:
         AZURE_CONNECTION_STRING,
         AZURE_CONTAINER_NAME,
         AZURE_OUTPUT_PREFIX,
+        AZURE_STORAGE_ACCOUNT,
         AZURE_VIDEO_PREFIX,
     )
 
@@ -48,7 +50,7 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 
 
-AZURE_STORAGE_ACCOUNT: str = "sahabsdatalakeprodweu"
+# AZURE_STORAGE_ACCOUNT is now defined in config.py and imported above
 
 
 def build_client() -> BlobServiceClient:
