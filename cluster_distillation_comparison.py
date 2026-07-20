@@ -521,7 +521,9 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--protocol",    default="protocolaudio",
-                   help="NEURO sub-protocol folder (default: protocolaudio)")
+                   help="NEURO sub-protocol folder (default: protocolaudio). "
+                        "Use 'all' to load all 5 protocols simultaneously "
+                        "(protocolimage, protocolaudio, protocolbel, protocoldanone, protocolNRJ).")
     p.add_argument("--folds",       type=int,   default=N_FOLDS,
                    help=f"Number of KFold CV splits (default: {N_FOLDS})")
     p.add_argument("--alpha",       type=float, default=ALPHA,
@@ -632,6 +634,12 @@ def main() -> None:
 
         log.info("  [D] Cluster-relabelled targets + KD…")
         all_metrics["D_Relabelled_KD"].append(run_strategy_d(**shared))
+
+        # Free GPU/MPS memory between folds
+        if device == "mps":
+            torch.mps.empty_cache()
+        elif device == "cuda":
+            torch.cuda.empty_cache()
 
         log.info("  Fold %d complete.", fold + 1)
 

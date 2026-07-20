@@ -122,32 +122,19 @@ MODALITY_DELAYS: dict[str, int] = {
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(protocol: str = "protocolaudio",
-              delay_sec: int = 0) -> tuple["pd.DataFrame", list[str]]:
-    """Load and merge physio features, self-report labels, and physio-derived labels.
+ALL_PROTOCOLS = [
+    "protocolimage",
+    "protocolaudio",
+    "protocolbel",
+    "protocoldanone",
+    "protocolNRJ",
+]
 
-    Args:
-        protocol:  NEURO sub-protocol folder (e.g. ``protocolaudio``).
-        delay_sec: Additional global minimum ``win_idx_in_trial`` for physio-derived
-                   *teacher labels* (applied on top of per-feature ``MODALITY_DELAYS``
-                   which already handle latency in the feature aggregation).
-                   Set to 0 (default) to rely entirely on the per-feature delays.
-    """
-    from azure.identity import DefaultAzureCredential
-    from azure.storage.blob import BlobServiceClient
 
-    logging.disable(logging.CRITICAL)
-    client = BlobServiceClient(
-        "https://sahabsdatalakeprodweu.blob.core.windows.net",
-        credential=DefaultAzureCredential(),
-    )
-    cc = client.get_container_client("silver")
-    logging.disable(logging.NOTSET)
-
-    # ── Self-report + physio features ─────────────────────────────────────
-    log.info("Loading features_arousal CSVs from %s…", protocol)
+def _load_protocol_rows(cc, protocol: str) -> list["pd.DataFrame"]:
+    """Return a list of per-participant trial DataFrames for one NEURO protocol folder."""
     prefix = f"NEURO/{protocol}/auxiliary_signals/"
-    rows = []
+    rows: list[pd.DataFrame] = []
     for blob in cc.list_blobs(name_starts_with=prefix):
         fname = blob.name.split("/")[-1]
         m = re.match(r"features_arousal_(P\d+)_(day\d+)\.csv", fname)
@@ -164,7 +151,7 @@ def load_data(protocol: str = "protocolaudio",
             # For each group, apply per-feature response-latency delay:
             # only average time windows where win_idx_in_trial >= that feature's delay.
             has_win_idx = "win_idx_in_trial" in stim.columns
-            agg_rows = []
+            agg_rows: list[dict] = []
             for (video, start_marker), trial in stim.groupby(["video", "start"]):
                 row: dict = {"video": video, "start": start_marker}
                 for col in PHYSIO_COLS:
@@ -186,12 +173,57 @@ def load_data(protocol: str = "protocolaudio",
             trial_df = pd.DataFrame(agg_rows)
             trial_df["participant"] = pid
             trial_df["session"] = day
+            trial_df["protocol"] = protocol
             rows.append(trial_df)
         except Exception as exc:
-            log.debug("Skip %s: %s", fname, exc)
+            log.debug("Skip %s/%s: %s", protocol, fname, exc)
+    return rows
+
+
+def load_data(protocol: str = "protocolaudio",
+              delay_sec: int = 0) -> tuple["pd.DataFrame", list[str]]:
+    """Load and merge physio features, self-report labels, and physio-derived labels.
+
+    Args:
+        protocol:  NEURO sub-protocol folder (e.g. ``protocolaudio``), or ``"all"``
+                   to load all 5 protocols simultaneously (protocolimage, protocolaudio,
+                   protocolbel, protocoldanone, protocolNRJ).  Rows are deduplicated on
+                   (participant, video) after concatenation so cross-protocol duplicates
+                   are collapsed.
+        delay_sec: Additional global minimum ``win_idx_in_trial`` for physio-derived
+                   *teacher labels* (applied on top of per-feature ``MODALITY_DELAYS``
+                   which already handle latency in the feature aggregation).
+                   Set to 0 (default) to rely entirely on the per-feature delays.
+    """
+    from azure.identity import DefaultAzureCredential
+    from azure.storage.blob import BlobServiceClient
+
+    logging.disable(logging.CRITICAL)
+    client = BlobServiceClient(
+        "https://sahabsdatalakeprodweu.blob.core.windows.net",
+        credential=DefaultAzureCredential(),
+    )
+    cc = client.get_container_client("silver")
+    logging.disable(logging.NOTSET)
+
+    # ── Self-report + physio features ─────────────────────────────────────
+    protocols_to_load = ALL_PROTOCOLS if protocol == "all" else [protocol]
+    rows: list[pd.DataFrame] = []
+    for proto in protocols_to_load:
+        log.info("Loading features_arousal CSVs from %s…", proto)
+        rows.extend(_load_protocol_rows(cc, proto))
 
     base = pd.concat(rows, ignore_index=True)
     base = base.dropna(subset=["rating_valence", "rating_arousal"]).reset_index(drop=True)
+
+    # Deduplicate on (participant, video) — keep first occurrence when multiple
+    # protocols recorded the same participant/stimulus pair.
+    before_dedup = len(base)
+    base = base.drop_duplicates(subset=["participant", "video"]).reset_index(drop=True)
+    if before_dedup != len(base):
+        log.info("Deduplication: %d → %d rows (removed %d cross-protocol duplicates)",
+                 before_dedup, len(base), before_dedup - len(base))
+
     log.info("Self-report data: %d rows, %d stimuli, %d participants",
              len(base), base["video"].nunique(), base["participant"].nunique())
 

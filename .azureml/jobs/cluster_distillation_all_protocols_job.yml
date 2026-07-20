@@ -1,0 +1,76 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+type: command
+
+# ── Source code ──────────────────────────────────────────────────────────────
+# Uploads the repo root so cluster_distillation_comparison.py,
+# cross_modal_distillation.py and cluster_relabel.py are all on PYTHONPATH.
+code: ../..
+
+# ── Inputs (read-only) ───────────────────────────────────────────────────────
+# The script streams data directly via DefaultAzureCredential + Azure Blob SDK;
+# the silver root mount is here for convenience and future use.
+inputs:
+  silver_input:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://datastores/adlsgen2_silver_weu/paths/
+
+# ── Outputs (read-write) ──────────────────────────────────────────────────────
+outputs:
+  results_output:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://datastores/adlsgen2_silver_weu/paths/AI/ai-multimodal-multimedia/distillation_results_all_protocols/
+
+# ── Managed identity (DefaultAzureCredential resolves to the compute MSI) ────
+identity:
+  type: managed
+
+# ── Environment variables ─────────────────────────────────────────────────────
+environment_variables:
+  AZURE_STORAGE_ACCOUNT: sahabsdatalakeprodweu
+
+# ── Command ───────────────────────────────────────────────────────────────────
+command: >
+  bash -lc '
+    set -euo pipefail
+
+    echo "=========================================="
+    echo "Installing dependencies (torch + extras)..."
+    pip install torch scikit-learn azure-identity azure-storage-blob pandas numpy scipy --quiet
+
+    echo "=========================================="
+    echo "Python version:"
+    python --version
+    echo "PyTorch version:"
+    python -c "import torch; print(torch.__version__)"
+    echo "Torch CUDA available:" $(python -c "import torch; print(torch.cuda.is_available())")
+    echo "=========================================="
+
+    echo "Starting cluster_distillation_comparison.py (protocol=all)..."
+    python -u cluster_distillation_comparison.py \
+      --protocol    all  \
+      --folds       5    \
+      --alpha       0.5  \
+      --temperature 3.0  \
+      --output-dir  "${{outputs.results_output}}"
+
+    echo "=========================================="
+    echo "Job complete."
+  '
+
+# ── Compute + environment ─────────────────────────────────────────────────────
+compute: azureml:H100-EUW-INFERENCE
+environment: azureml:gsr-modeling:7
+
+# ── Experiment metadata ───────────────────────────────────────────────────────
+experiment_name: cluster-distillation-comparison
+display_name: cluster_distillation_all_protocols
+description: >
+  Compares 6 cluster-aware knowledge-distillation strategies
+  (Baseline / Global KD / Cluster Teachers / Cluster Feature /
+  Cluster Alpha / Relabelled KD) across ALL 5 NEURO protocols simultaneously
+  (protocolimage, protocolaudio, protocolbel, protocoldanone, protocolNRJ).
+  Rows are deduplicated on (participant, video) after concatenation.
+  Results JSON is written to
+  adlsgen2_silver_weu/AI/ai-multimodal-multimedia/distillation_results_all_protocols/.
