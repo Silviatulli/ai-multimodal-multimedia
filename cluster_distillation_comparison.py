@@ -225,6 +225,8 @@ def _train_student_from_probs(
         perm = np.random.permutation(len(X))
         for i in range(0, len(X), batch):
             idx = perm[i : i + batch]
+            if len(idx) < 2:   # BatchNorm1d requires >1 sample during training
+                continue
             reg_pred, soft_pred = model(Xt[idx])
             task_loss = F.mse_loss(reg_pred, yr[idx])
             if tp is not None:
@@ -265,6 +267,8 @@ def _train_student_per_sample_alpha(
         perm = np.random.permutation(len(X))
         for i in range(0, len(X), batch):
             idx = perm[i : i + batch]
+            if len(idx) < 2:   # BatchNorm1d requires >1 sample during training
+                continue
             reg_pred, soft_pred = model(Xt[idx])
             # Per-sample task loss
             task_per = F.mse_loss(reg_pred, yr[idx], reduction="none").mean(dim=1)

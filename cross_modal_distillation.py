@@ -355,7 +355,7 @@ def train_teacher(
         for i in range(0, len(X), batch):
             idx   = perm[i:i + batch]
             idx_v = idx[valid_cpu[idx]]
-            if not len(idx_v):
+            if len(idx_v) < 2:   # BatchNorm1d requires >1 sample during training
                 continue
             loss = F.cross_entropy(model(Xt[idx_v]), yt[idx_v])
             opt.zero_grad(); loss.backward(); opt.step()
@@ -395,6 +395,8 @@ def train_student(
         perm = np.random.permutation(len(X))
         for i in range(0, len(X), batch):
             idx = perm[i:i + batch]
+            if len(idx) < 2:   # BatchNorm1d requires >1 sample during training
+                continue
             reg_pred, soft_pred = model(Xt[idx])
 
             # Task loss: MSE on self-report ratings
