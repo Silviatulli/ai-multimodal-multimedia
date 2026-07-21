@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from scipy.stats import pearsonr
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
-from sklearn.metrics import r2_score
+from sklearn.metrics import accuracy_score, f1_score, r2_score
 from sklearn.model_selection import KFold
 from sklearn.neighbors import NearestCentroid
 from sklearn.preprocessing import StandardScaler
@@ -304,6 +304,117 @@ def _eval(model: StudentNet, X_test: np.ndarray, y_test: np.ndarray, device: str
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Label predictability — physio-derived label vs. self-report label
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Both label sources are reduced to the same 3-class (Low/Med/High) scheme and
+# predicted from the *same* physio input features with the *same* TeacherNet
+# architecture, so accuracy / macro-F1 are directly comparable across sources.
+
+N_CLASSES = 3
+
+
+def _tercile_edges(y_train: np.ndarray) -> np.ndarray:
+    """33rd / 66th percentile cut points computed on the training fold only."""
+    return np.quantile(y_train, [1 / 3, 2 / 3])
+
+
+def _tercile_class(y: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Bucket continuous ratings into 0=Low / 1=Med / 2=High using train-fold edges."""
+    return np.digitize(y, edges).astype(int)
+
+
+def _classifier_eval(model: TeacherNet, X_test: np.ndarray, y_test_class: np.ndarray,
+                      device: str) -> dict:
+    """Accuracy + macro-F1 on the subset of *y_test_class* that is valid (>=0)."""
+    valid = y_test_class >= 0
+    out = {"n": int(valid.sum())}
+    if valid.sum() == 0:
+        out["accuracy"] = float("nan")
+        out["macro_f1"] = float("nan")
+        return out
+    Xt = torch.tensor(X_test[valid], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        pred = model(Xt).argmax(dim=1).cpu().numpy()
+    yt = y_test_class[valid]
+    out["accuracy"] = float(accuracy_score(yt, pred))
+    out["macro_f1"] = float(f1_score(yt, pred, average="macro",
+                                      labels=list(range(N_CLASSES)), zero_division=0))
+    return out
+
+
+def run_label_predictability_fold(
+    X_tr: np.ndarray, X_te: np.ndarray,
+    y_tr_reg: np.ndarray, y_te_reg: np.ndarray,
+    physio_arousal_tr: np.ndarray, physio_arousal_te: np.ndarray,
+    physio_valence_tr: np.ndarray, physio_valence_te: np.ndarray,
+    device: str,
+) -> dict:
+    """For one CV fold, train/evaluate a same-architecture classifier on each of
+    4 label sources: {arousal, valence} x {physio-derived, self-report tercile}.
+    """
+    out: dict[str, dict] = {}
+
+    # Physio-derived labels — already 3-class, missing rows marked -1.
+    for tgt, tr_cl, te_cl in (
+        ("arousal", physio_arousal_tr, physio_arousal_te),
+        ("valence", physio_valence_tr, physio_valence_te),
+    ):
+        model = _train_cluster_teacher(X_tr, tr_cl, n_epochs=N_EPOCHS_TEACHER, device=device)
+        out[f"physio_{tgt}"] = _classifier_eval(model, X_te, te_cl, device)
+
+    # Self-report ratings — tercile-binned into the same 3-class scheme, edges
+    # fit on the training fold only (no leakage). Always fully labelled.
+    for i, tgt in enumerate(("valence", "arousal")):
+        edges = _tercile_edges(y_tr_reg[:, i])
+        tr_cl = _tercile_class(y_tr_reg[:, i], edges)
+        te_cl = _tercile_class(y_te_reg[:, i], edges)
+        model = _train_cluster_teacher(X_tr, tr_cl, n_epochs=N_EPOCHS_TEACHER, device=device)
+        out[f"self_report_{tgt}"] = _classifier_eval(model, X_te, te_cl, device)
+
+    return out
+
+
+def _print_predictability_table(fold_metrics: list[dict]) -> dict:
+    """Aggregate per-fold label-predictability metrics, print a summary table,
+    and return the aggregated dict (for JSON export).
+    """
+    W = 82
+    sep = "═" * W
+    thin = "─" * W
+    keys = list(fold_metrics[0].keys())   # e.g. physio_arousal, self_report_arousal, ...
+    agg: dict[str, dict] = {}
+    for k in keys:
+        accs = [f[k]["accuracy"] for f in fold_metrics if not np.isnan(f[k]["accuracy"])]
+        f1s  = [f[k]["macro_f1"] for f in fold_metrics if not np.isnan(f[k]["macro_f1"])]
+        ns   = [f[k]["n"] for f in fold_metrics]
+        agg[k] = {
+            "accuracy": float(np.mean(accs)) if accs else float("nan"),
+            "macro_f1": float(np.mean(f1s)) if f1s else float("nan"),
+            "mean_n_test": float(np.mean(ns)),
+        }
+
+    print()
+    print(sep)
+    print(f"  Label Predictability — physio-derived vs. self-report (tercile) labels  "
+          f"({N_FOLDS}-fold CV, same TeacherNet architecture + physio features)")
+    print(sep)
+    print(f"  {'Target':<10}  {'Label source':<18}  {'Mean N (test)':>13}  "
+          f"{'Accuracy':>9}  {'Macro F1':>9}")
+    print(thin)
+    for tgt in ("arousal", "valence"):
+        for src, label in (("physio", "Physio-derived"), ("self_report", "Self-report")):
+            k = f"{src}_{tgt}"
+            a = agg[k]
+            print(f"  {tgt.capitalize():<10}  {label:<18}  {a['mean_n_test']:>13.1f}  "
+                  f"{a['accuracy']:>9.4f}  {a['macro_f1']:>9.4f}")
+    print(sep)
+    print()
+
+    return agg
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Per-condition runners
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -564,6 +675,11 @@ def main() -> None:
         data["arousal_three_all"].fillna(-1).values.astype(int),
         -1,
     )
+    valence_class = np.where(
+        data["valence_three_all"].notna(),
+        data["valence_three_all"].fillna(-1).values.astype(int),
+        -1,
+    )
     log.info("Physio label coverage: %d%%  |  total rows: %d  |  participants: %d",
              int(100 * (y_class >= 0).mean()), len(data), data["participant"].nunique())
 
@@ -589,6 +705,7 @@ def main() -> None:
         "D_Relabelled_KD",
     ]
     all_metrics: dict[str, list[dict]] = {c: [] for c in conditions}
+    predictability_fold_metrics: list[dict] = []
 
     for fold, (tr_idx, te_idx) in enumerate(cv.split(X_raw)):
         log.info("── Fold %d / %d ──────────────────────────────────────────────", fold + 1, N_FOLDS)
@@ -599,6 +716,9 @@ def main() -> None:
         y_tr      = y_reg[tr_idx]
         y_te      = y_reg[te_idx]
         y_tr_cl   = y_class[tr_idx]
+        y_te_cl   = y_class[te_idx]
+        val_tr_cl = valence_class[tr_idx]
+        val_te_cl = valence_class[te_idx]
 
         cluster_tr = global_clusters[tr_idx]
         cluster_te = global_clusters[te_idx]
@@ -639,6 +759,15 @@ def main() -> None:
         log.info("  [D] Cluster-relabelled targets + KD…")
         all_metrics["D_Relabelled_KD"].append(run_strategy_d(**shared))
 
+        log.info("  [P] Label predictability (physio-derived vs. self-report)…")
+        predictability_fold_metrics.append(run_label_predictability_fold(
+            X_tr=X_tr, X_te=X_te,
+            y_tr_reg=y_tr, y_te_reg=y_te,
+            physio_arousal_tr=y_tr_cl, physio_arousal_te=y_te_cl,
+            physio_valence_tr=val_tr_cl, physio_valence_te=val_te_cl,
+            device=device,
+        ))
+
         # Free GPU/MPS memory between folds
         if device == "mps":
             torch.mps.empty_cache()
@@ -649,6 +778,7 @@ def main() -> None:
 
     # ── Print results ─────────────────────────────────────────────────────────
     _print_table(all_metrics, conditions)
+    predictability_agg = _print_predictability_table(predictability_fold_metrics)
 
     # ── Save results JSON ─────────────────────────────────────────────────────
     if args.output_dir is not None:
@@ -672,6 +802,10 @@ def main() -> None:
                 k: round(float(np.mean([f[k] for f in folds_data])), 4)
                 for k in metrics_keys
             }
+        summary["label_predictability"] = {
+            k: {kk: round(vv, 4) for kk, vv in v.items()}
+            for k, v in predictability_agg.items()
+        }
         out_path = out_dir / "cluster_distillation_results.json"
         out_path.write_text(json.dumps(summary, indent=2))
         log.info("Results saved to %s", out_path)
