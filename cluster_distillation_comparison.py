@@ -18,6 +18,10 @@ Conditions
   D. Relabelled KD     — Self-report labels shrunk toward cluster centroids via
                          cluster_relabel.build_cluster_relabel_candidate, then student
                          trained on shrunk labels + global teacher KD
+  E. Dual Valence KD   — Distils BOTH arousal and valence physio-derived labels (not just
+                         arousal, as in every other condition) via two independent student
+                         soft heads; the valence teacher uses inverse-frequency class
+                         weighting to counter valence_three_all's ~62%-in-one-bucket skew.
 
 t-SNE + KMeans (k=4, perplexity=15) clustering on the per-participant mean physio
 feature matrix, scaled with StandardScaler — matches the t-SNE analysis that identified
@@ -48,6 +52,7 @@ from cross_modal_distillation import (
     PHYSIO_COLS,       # noqa: F401
     StudentNet,
     TeacherNet,
+    class_weights_from_labels,
     load_data,
     train_teacher,
 )
@@ -175,13 +180,24 @@ def _train_cluster_teacher(
     lr: float = 1e-3,
     batch: int = 128,
     device: str = "cpu",
+    class_weights: np.ndarray | None = None,
 ) -> TeacherNet:
-    """Like train_teacher but skips batches with <2 valid samples (handles small clusters)."""
+    """Like train_teacher but skips batches with <2 valid samples (handles small clusters).
+
+    Args:
+        class_weights: optional per-class cross-entropy weights (see
+            ``cross_modal_distillation.class_weights_from_labels``) — use for
+            imbalanced label sources such as ``valence_three_all``.
+    """
     model = TeacherNet(X.shape[1]).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     Xt = torch.tensor(X, dtype=torch.float32, device=device)
     yt = torch.tensor(y_class, dtype=torch.long, device=device)
     valid_cpu = (yt >= 0).cpu().numpy()
+    weight_t = (
+        torch.tensor(class_weights, dtype=torch.float32, device=device)
+        if class_weights is not None else None
+    )
 
     model.train()
     for _ in range(n_epochs):
@@ -191,7 +207,7 @@ def _train_cluster_teacher(
             idx_v = idx[valid_cpu[idx]]
             if len(idx_v) < 2:   # BatchNorm1d requires >1 sample during training
                 continue
-            loss = F.cross_entropy(model(Xt[idx_v]), yt[idx_v])
+            loss = F.cross_entropy(model(Xt[idx_v]), yt[idx_v], weight=weight_t)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -285,6 +301,59 @@ def _train_student_per_sample_alpha(
     return model
 
 
+def _train_student_dual_kd(
+    X: np.ndarray,
+    y_reg: np.ndarray,
+    arousal_probs: np.ndarray,       # (N, n_classes) — arousal teacher soft targets
+    valence_probs: np.ndarray,       # (N, n_classes) — valence teacher soft targets
+    n_epochs: int = N_EPOCHS_STUDENT,
+    lr: float = 1e-3,
+    batch: int = 128,
+    alpha: float = ALPHA,
+    temperature: float = TEMPERATURE,
+    device: str = "cpu",
+) -> StudentNet:
+    """Strategy E — distill from *two* teachers at once: the student's
+    ``soft_head`` learns from the arousal teacher and ``soft_head_valence``
+    learns from the valence teacher, each via its own KD loss.
+    """
+    model = StudentNet(X.shape[1], n_targets=y_reg.shape[1]).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    Xt = torch.tensor(X, dtype=torch.float32, device=device)
+    yr = torch.tensor(y_reg, dtype=torch.float32, device=device)
+    ap = torch.tensor(arousal_probs, dtype=torch.float32, device=device)
+    vp = torch.tensor(valence_probs, dtype=torch.float32, device=device)
+
+    model.train()
+    for _ in range(n_epochs):
+        perm = np.random.permutation(len(X))
+        for i in range(0, len(X), batch):
+            idx = perm[i : i + batch]
+            if len(idx) < 2:   # BatchNorm1d requires >1 sample during training
+                continue
+            feat = model.backbone(Xt[idx])
+            reg_pred      = model.reg_head(feat)
+            soft_arousal  = model.soft_head(feat)
+            soft_valence  = model.soft_head_valence(feat)
+
+            task_loss = F.mse_loss(reg_pred, yr[idx])
+
+            sl_a = F.log_softmax(soft_arousal / temperature, dim=1)
+            kd_a = F.kl_div(sl_a, ap[idx], reduction="batchmean") * temperature**2
+
+            sl_v = F.log_softmax(soft_valence / temperature, dim=1)
+            kd_v = F.kl_div(sl_v, vp[idx], reduction="batchmean") * temperature**2
+
+            kd_loss = 0.5 * (kd_a + kd_v)
+            loss = (1 - alpha) * task_loss + alpha * kd_loss
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    return model
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Evaluation helper
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,11 +425,15 @@ def run_label_predictability_fold(
     out: dict[str, dict] = {}
 
     # Physio-derived labels — already 3-class, missing rows marked -1.
+    # Valence terciles are heavily skewed (~62% in the middle class) so we
+    # class-weight its cross-entropy loss; arousal is already near-balanced.
     for tgt, tr_cl, te_cl in (
         ("arousal", physio_arousal_tr, physio_arousal_te),
         ("valence", physio_valence_tr, physio_valence_te),
     ):
-        model = _train_cluster_teacher(X_tr, tr_cl, n_epochs=N_EPOCHS_TEACHER, device=device)
+        weights = class_weights_from_labels(tr_cl) if tgt == "valence" else None
+        model = _train_cluster_teacher(X_tr, tr_cl, n_epochs=N_EPOCHS_TEACHER, device=device,
+                                        class_weights=weights)
         out[f"physio_{tgt}"] = _classifier_eval(model, X_te, te_cl, device)
 
     # Self-report ratings — tercile-binned into the same 3-class scheme, edges
@@ -558,6 +631,35 @@ def run_strategy_d(
     return _eval(student, X_te, y_te, device)
 
 
+def run_strategy_e_dual_valence_kd(
+    X_tr, X_te, y_tr, y_te, y_tr_class, device,
+    valence_tr_class, **_
+) -> dict:
+    """Strategy E — Dual KD: distill BOTH arousal and (class-weighted) valence
+    physio-derived labels into the student, via two independent soft heads.
+
+    Unlike conditions 0/1/A-D — which only ever distil the arousal
+    physio-derived label (`valence_three_all` is loaded but otherwise unused
+    throughout the pipeline) — this uses a second teacher trained on
+    `valence_three_all`, with inverse-frequency class weighting to counter
+    its ~62%-in-one-bucket imbalance (vs. arousal's near-even split).
+    """
+    alpha       = _.get("alpha",       ALPHA)
+    temperature = _.get("temperature", TEMPERATURE)
+
+    arousal_teacher = train_teacher(X_tr, y_tr_class, n_epochs=N_EPOCHS_TEACHER, device=device)
+    arousal_probs = _teacher_probs(arousal_teacher, X_tr, temperature, device)
+
+    valence_weights = class_weights_from_labels(valence_tr_class)
+    valence_teacher = _train_cluster_teacher(X_tr, valence_tr_class, n_epochs=N_EPOCHS_TEACHER,
+                                              device=device, class_weights=valence_weights)
+    valence_probs = _teacher_probs(valence_teacher, X_tr, temperature, device)
+
+    student = _train_student_dual_kd(X_tr, y_tr, arousal_probs, valence_probs,
+                                      alpha=alpha, temperature=temperature, device=device)
+    return _eval(student, X_te, y_te, device)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Results table
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -569,6 +671,7 @@ _CONDITION_DISPLAY = {
     "B_Cluster_Feature":  "B  Cluster ID Feature",
     "C_Cluster_Alpha":    "C  Cluster-Aware Alpha",
     "D_Relabelled_KD":    "D  Relabelled Targets + KD",
+    "E_Dual_Valence_KD":  "E  Dual KD (+weighted valence)",
 }
 
 
@@ -703,6 +806,7 @@ def main() -> None:
         "B_Cluster_Feature",
         "C_Cluster_Alpha",
         "D_Relabelled_KD",
+        "E_Dual_Valence_KD",
     ]
     all_metrics: dict[str, list[dict]] = {c: [] for c in conditions}
     predictability_fold_metrics: list[dict] = []
@@ -738,6 +842,7 @@ def main() -> None:
             cluster_tr=cluster_tr, cluster_te=cluster_te,
             cluster_b_tr=cluster_b_tr, cluster_b_te=cluster_b_te,
             data_tr=data_tr, feat_cols=feat_cols,
+            valence_tr_class=val_tr_cl,
             alpha=args.alpha, temperature=args.temperature,
         )
 
@@ -758,6 +863,9 @@ def main() -> None:
 
         log.info("  [D] Cluster-relabelled targets + KD…")
         all_metrics["D_Relabelled_KD"].append(run_strategy_d(**shared))
+
+        log.info("  [E] Dual KD (arousal + class-weighted valence)…")
+        all_metrics["E_Dual_Valence_KD"].append(run_strategy_e_dual_valence_kd(**shared))
 
         log.info("  [P] Label predictability (physio-derived vs. self-report)…")
         predictability_fold_metrics.append(run_label_predictability_fold(

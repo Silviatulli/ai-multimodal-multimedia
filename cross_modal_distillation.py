@@ -297,6 +297,13 @@ class StudentNet(nn.Module):
     The regression head predicts continuous valence/arousal (self-report).
     The classification head produces soft probabilities distilled from
     the Teacher.  At inference only the regression head is used.
+
+    ``soft_head`` is the original arousal-distillation head, kept as the
+    2nd element of ``forward()``'s return tuple for backward compatibility.
+    ``soft_head_valence`` is an additional head — always present but only
+    read by callers that opt into dual (arousal + valence) distillation
+    (see ``cluster_distillation_comparison.run_strategy_e_dual_valence_kd``);
+    ``forward()`` ignores it so every existing caller is unaffected.
     """
 
     def __init__(self, n_features: int, n_targets: int = 2, n_classes: int = 3,
@@ -309,7 +316,8 @@ class StudentNet(nn.Module):
             in_dim = h
         self.backbone  = nn.Sequential(*layers)
         self.reg_head  = nn.Linear(in_dim, n_targets)    # → continuous ratings
-        self.soft_head = nn.Linear(in_dim, n_classes)    # → 3-class logits (distillation)
+        self.soft_head = nn.Linear(in_dim, n_classes)    # → 3-class logits (arousal distillation)
+        self.soft_head_valence = nn.Linear(in_dim, n_classes)  # → 3-class logits (valence distillation)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat  = self.backbone(x)
@@ -333,6 +341,21 @@ def soft_labels(y_class: torch.Tensor, temperature: float,
     return F.softmax(logits / temperature, dim=1)
 
 
+def class_weights_from_labels(y_class: np.ndarray, n_classes: int = 3) -> np.ndarray:
+    """Inverse-frequency class weights over the *valid* (>=0) labels.
+
+    Weights are normalized to mean 1 so the overall loss scale is unchanged
+    for a balanced label (all weights ≈1); an imbalanced label instead gets
+    up-weighted minority classes. Use for label sources like
+    ``valence_three_all`` where one class dominates (~62% in one bucket).
+    """
+    valid = y_class[y_class >= 0]
+    counts = np.array([np.sum(valid == c) for c in range(n_classes)], dtype=np.float64)
+    counts = np.where(counts == 0, 1.0, counts)   # avoid div-by-zero for unseen classes
+    weights = counts.sum() / (n_classes * counts)
+    return weights.astype(np.float32)
+
+
 def train_teacher(
     X: np.ndarray,
     y_class: np.ndarray,
@@ -340,13 +363,24 @@ def train_teacher(
     lr: float = 1e-3,
     batch: int = 128,
     device: str = "cpu",
+    class_weights: np.ndarray | None = None,
 ) -> TeacherNet:
-    """Train Teacher on physio-derived 3-class labels."""
+    """Train Teacher on physio-derived 3-class labels.
+
+    Args:
+        class_weights: optional per-class weights (see
+            ``class_weights_from_labels``) passed to the cross-entropy loss
+            to counteract label imbalance (e.g. skewed valence terciles).
+    """
     model = TeacherNet(X.shape[1]).to(device)
     opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     Xt    = torch.tensor(X, dtype=torch.float32, device=device)
     yt    = torch.tensor(y_class, dtype=torch.long, device=device)
     valid = yt >= 0
+    weight_t = (
+        torch.tensor(class_weights, dtype=torch.float32, device=device)
+        if class_weights is not None else None
+    )
 
     model.train()
     valid_cpu = valid.cpu().numpy()   # boolean mask on CPU for indexing
@@ -357,7 +391,7 @@ def train_teacher(
             idx_v = idx[valid_cpu[idx]]
             if len(idx_v) < 2:   # BatchNorm1d requires >1 sample during training
                 continue
-            loss = F.cross_entropy(model(Xt[idx_v]), yt[idx_v])
+            loss = F.cross_entropy(model(Xt[idx_v]), yt[idx_v], weight=weight_t)
             opt.zero_grad(); loss.backward(); opt.step()
     model.eval()
     return model
