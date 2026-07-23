@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, f1_score, r2_score
@@ -358,8 +358,43 @@ def _train_student_dual_kd(
 # Evaluation helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _eval(model: StudentNet, X_test: np.ndarray, y_test: np.ndarray, device: str) -> dict:
-    """Return valence/arousal R² and Pearson r on the test fold."""
+def _physio_alignment_metrics(pred: np.ndarray, physio_class: np.ndarray, tgt: str) -> dict:
+    """How well does a *continuous* prediction track the physio-derived ordinal
+    class (0=Low/1=Med/2=High)? Restricted to rows with a valid (>=0) physio
+    label. Spearman rho is the natural fit here — physio_class is ordinal,
+    not linearly-spaced, so rank correlation is more appropriate than R²/
+    Pearson (which assume a continuous, interval-scaled target).
+    """
+    valid = physio_class >= 0
+    out: dict = {f"{tgt}_vs_physio_n": int(valid.sum())}
+    class_names = ("low", "med", "high")
+    if valid.sum() < 2:
+        out[f"{tgt}_vs_physio_spearman"] = float("nan")
+        for name in class_names:
+            out[f"{tgt}_vs_physio_mean_{name}"] = float("nan")
+        return out
+    p, c = pred[valid], physio_class[valid]
+    rho = spearmanr(p, c)[0]
+    out[f"{tgt}_vs_physio_spearman"] = float(rho) if np.isfinite(rho) else float("nan")
+    for cls, name in enumerate(class_names):
+        m = c == cls
+        out[f"{tgt}_vs_physio_mean_{name}"] = float(p[m].mean()) if m.sum() else float("nan")
+    return out
+
+
+def _eval(
+    model: StudentNet, X_test: np.ndarray, y_test: np.ndarray, device: str,
+    physio_valence_class: np.ndarray | None = None,
+    physio_arousal_class: np.ndarray | None = None,
+) -> dict:
+    """Return valence/arousal R² and Pearson r against self-report ratings.
+
+    If ``physio_valence_class`` / ``physio_arousal_class`` are given (the
+    test-fold ``valence_three_all`` / ``arousal_three_all`` labels), also
+    scores the *same* predictions against the physio-derived ground truth —
+    lets you compare "predicted vs. self-report" and "predicted vs. physio"
+    for the same trained model side by side.
+    """
     Xt = torch.tensor(X_test, dtype=torch.float32, device=device)
     with torch.no_grad():
         pred, _ = model(Xt)
@@ -369,6 +404,10 @@ def _eval(model: StudentNet, X_test: np.ndarray, y_test: np.ndarray, device: str
         yt, yp = y_test[:, i], p[:, i]
         out[f"{tgt}_r2"] = float(r2_score(yt, yp))
         out[f"{tgt}_pearson"] = float(pearsonr(yt, yp)[0])
+    if physio_valence_class is not None:
+        out.update(_physio_alignment_metrics(p[:, 0], physio_valence_class, "valence"))
+    if physio_arousal_class is not None:
+        out.update(_physio_alignment_metrics(p[:, 1], physio_arousal_class, "arousal"))
     return out
 
 
@@ -495,7 +534,9 @@ def run_baseline(X_tr, X_te, y_tr, y_te, **_) -> dict:
     """Condition 0 — Student only, no distillation."""
     device = _.get("device", "cpu")
     student = _train_student_from_probs(X_tr, y_tr, teacher_probs=None, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_global_kd(X_tr, X_te, y_tr, y_te, y_tr_class, device, **_) -> dict:
@@ -506,7 +547,9 @@ def run_global_kd(X_tr, X_te, y_tr, y_te, y_tr_class, device, **_) -> dict:
     tp = _teacher_probs(teacher, X_tr, temperature, device)
     student = _train_student_from_probs(X_tr, y_tr, tp, alpha=alpha,
                                         temperature=temperature, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_strategy_a(
@@ -533,7 +576,9 @@ def run_strategy_a(
 
     student = _train_student_from_probs(X_tr, y_tr, assembled_tp, alpha=alpha,
                                         temperature=temperature, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_strategy_b(
@@ -557,7 +602,9 @@ def run_strategy_b(
 
     student = _train_student_from_probs(X_tr_aug, y_tr, tp, alpha=alpha,
                                         temperature=temperature, device=device)
-    return _eval(student, X_te_aug, y_te, device)
+    return _eval(student, X_te_aug, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_strategy_c(
@@ -585,7 +632,9 @@ def run_strategy_c(
 
     student = _train_student_per_sample_alpha(X_tr, y_tr, tp, sample_alphas,
                                               temperature=temperature, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_strategy_d(
@@ -596,7 +645,7 @@ def run_strategy_d(
     alpha       = _.get("alpha",       ALPHA)
     temperature = _.get("temperature", TEMPERATURE)
     try:
-        relabeled, _ = build_cluster_relabel_candidate(
+        relabeled, _relabel_info = build_cluster_relabel_candidate(
             data_tr.copy(),
             id_column="participant",
             axes=["rating_valence", "rating_arousal"],
@@ -628,7 +677,9 @@ def run_strategy_d(
     tp = _teacher_probs(teacher, X_tr, temperature, device)
     student = _train_student_from_probs(X_tr, y_tr_relabeled, tp, alpha=alpha,
                                         temperature=temperature, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 def run_strategy_e_dual_valence_kd(
@@ -657,7 +708,9 @@ def run_strategy_e_dual_valence_kd(
 
     student = _train_student_dual_kd(X_tr, y_tr, arousal_probs, valence_probs,
                                       alpha=alpha, temperature=temperature, device=device)
-    return _eval(student, X_te, y_te, device)
+    return _eval(student, X_te, y_te, device,
+                 physio_valence_class=_.get("physio_valence_te"),
+                 physio_arousal_class=_.get("physio_arousal_te"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -727,6 +780,58 @@ def _print_table(all_metrics: dict[str, list[dict]], conditions: list[str]) -> N
 
     print(sep)
     print()
+
+
+def _print_physio_alignment_table(
+    all_metrics: dict[str, list[dict]], conditions: list[str]
+) -> dict:
+    """For each condition's trained Student, how well does its *predicted*
+    continuous valence/arousal track the physio-derived ordinal class on the
+    test fold (Spearman ρ), and does the mean prediction actually increase
+    from Low → Med → High? Complements ``_print_table`` (which only scores
+    predictions against self-report) with the physio-derived ground truth.
+    """
+    W = 92
+    sep = "═" * W
+    thin = "─" * W
+    print()
+    print(sep)
+    print("  Predicted Rating vs. Physio-Derived Class — does the Student's regression")
+    print("  output track the physio ground truth (not just self-report)?")
+    print(sep)
+    print(f"  {'Condition':<30}  {'Val ρ':>7}  {'Aro ρ':>7}  "
+          f"{'Aro pred: Low':>13}  {'Med':>7}  {'High':>7}")
+    print(thin)
+
+    agg: dict[str, dict] = {}
+    for cond in conditions:
+        folds = all_metrics[cond]
+        vrho = float(np.nanmean([f["valence_vs_physio_spearman"] for f in folds]))
+        arho = float(np.nanmean([f["arousal_vs_physio_spearman"] for f in folds]))
+        a_low  = float(np.nanmean([f["arousal_vs_physio_mean_low"]  for f in folds]))
+        a_med  = float(np.nanmean([f["arousal_vs_physio_mean_med"]  for f in folds]))
+        a_high = float(np.nanmean([f["arousal_vs_physio_mean_high"] for f in folds]))
+        v_low  = float(np.nanmean([f["valence_vs_physio_mean_low"]  for f in folds]))
+        v_med  = float(np.nanmean([f["valence_vs_physio_mean_med"]  for f in folds]))
+        v_high = float(np.nanmean([f["valence_vs_physio_mean_high"] for f in folds]))
+        agg[cond] = {
+            "valence_spearman": vrho, "arousal_spearman": arho,
+            "arousal_mean_low": a_low, "arousal_mean_med": a_med, "arousal_mean_high": a_high,
+            "valence_mean_low": v_low, "valence_mean_med": v_med, "valence_mean_high": v_high,
+        }
+        label = _CONDITION_DISPLAY.get(cond, cond)
+        print(f"  {label:<30}  {vrho:>7.4f}  {arho:>7.4f}  "
+              f"{a_low:>13.4f}  {a_med:>7.4f}  {a_high:>7.4f}")
+
+    print(sep)
+    print()
+    print("  (Val/Aro pred: Low/Med/High = mean predicted rating for test rows whose")
+    print("   physio-derived class is Low/Med/High. A useful model should show these")
+    print("   increasing monotonically — Low < Med < High.)")
+    print(sep)
+    print()
+
+    return agg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -843,6 +948,7 @@ def main() -> None:
             cluster_b_tr=cluster_b_tr, cluster_b_te=cluster_b_te,
             data_tr=data_tr, feat_cols=feat_cols,
             valence_tr_class=val_tr_cl,
+            physio_valence_te=val_te_cl, physio_arousal_te=y_te_cl,
             alpha=args.alpha, temperature=args.temperature,
         )
 
@@ -886,6 +992,7 @@ def main() -> None:
 
     # ── Print results ─────────────────────────────────────────────────────────
     _print_table(all_metrics, conditions)
+    physio_alignment_agg = _print_physio_alignment_table(all_metrics, conditions)
     predictability_agg = _print_predictability_table(predictability_fold_metrics)
 
     # ── Save results JSON ─────────────────────────────────────────────────────
@@ -913,6 +1020,10 @@ def main() -> None:
         summary["label_predictability"] = {
             k: {kk: round(vv, 4) for kk, vv in v.items()}
             for k, v in predictability_agg.items()
+        }
+        summary["predicted_vs_physio"] = {
+            k: {kk: round(vv, 4) if np.isfinite(vv) else None for kk, vv in v.items()}
+            for k, v in physio_alignment_agg.items()
         }
         out_path = out_dir / "cluster_distillation_results.json"
         out_path.write_text(json.dumps(summary, indent=2))
